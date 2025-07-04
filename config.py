@@ -1,17 +1,33 @@
-# config.py
+#!/usr/bin/env python3
+"""
+Wheel4 - Configuration
+Basic app configuration
+"""
 
-# OpenAI API Key - Replace with your actual key
-OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
+# Application info
+APP_NAME = "Wheel4 AI Brain"
+APP_VERSION = "2.0"
 
-# Hotkey to toggle the window's visibility
-HOTKEY = "<ctrl>+"
+# Hotkeys (can be modified here)
+TOGGLE_HOTKEY = "<ctrl>+\\"
+QUESTION_HOTKEY = "<ctrl>+<enter>"
 
-# Hotkey to ask AI about the screen/context
-ASK_AI_HOTKEY = "<ctrl>+enter"
+# UI Settings
+WINDOW_HEIGHT_NORMAL = 60      # Normal height (just status bar)
+WINDOW_HEIGHT_INPUT = 100      # Height when showing input
+WINDOW_HEIGHT_RESPONSE = 250   # Height when showing response
 
-# Audio settings
-SAMPLE_RATE = 16000  # Hz
-CHUNK_DURATION_MS = 30  # ms
-CHANNELS = 1
-VAD_AGGRESSIVENESS = 3  # 0 (least aggressive) to 3 (most aggressive)
-SILENCE_DURATION_S = 2  # Seconds of silence to consider an utterance complete
+# Auto-hide settings
+AUTO_HIDE_DELAY = 10000  # ms (10 seconds)
+
+# Database settings
+DATABASE_FILE = "ai_brain.db"
+PROMPTS_FILE = "prompts.md"
+
+# Debug settings
+DEBUG_LOGS = True
+
+def log(message):
+    """Simple logging function"""
+    if DEBUG_LOGS:
+        print(message)
