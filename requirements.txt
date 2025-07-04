@@ -1,0 +1,8 @@
+PyQt6
+sounddevice
+webrtcvad-wheels
+openai
+pynput
+numpy
+mss
+Pillow
