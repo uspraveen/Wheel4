@@ -1,8 +1,12 @@
 PyQt6
 sounddevice
 webrtcvad-wheels
-openai
+openai>=1.0.0
 pynput
 numpy
 mss
-Pillow
+Pillow>=9.0.0
+tiktoken
+requests
+python-dotenv
+packaging

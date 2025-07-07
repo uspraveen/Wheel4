@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Wheel4 - AI Brain UI
-Modern, clean interface with proper Claude orange theme
+Wheel4 - Enhanced Complete UI with Session-Based Custom Instructions
+Fixed hotkey handling and improved custom instructions dialog
 """
 
 from PyQt6.QtWidgets import *
@@ -11,55 +11,1435 @@ import threading
 import time
 import re
 import json
+import html
+import math
+import webbrowser
+import os
 
-from database import get_api_key, save_api_key, save_interaction, get_session_history
+from database import (
+    get_api_key, save_api_key, save_interaction, get_session_history, 
+    get_all_sessions, switch_to_session, create_new_session,
+    save_session_custom_instructions, get_session_custom_instructions,
+    get_session_info
+)
 from ai_service import get_ai_response, extract_json_from_response
 from screen_capture import capture_full_screen
 
-# Claude orange color palette
-CLAUDE_ORANGE = "#FF6B35"
-CLAUDE_ORANGE_LIGHT = "#FF8A65"
-CLAUDE_ORANGE_DARK = "#E65100"
+# Enhanced Color Palette with Higher Opacity
+GLASS_LIGHT = QColor(255, 255, 255, 60)    # Increased from 30
+GLASS_MEDIUM = QColor(255, 255, 255, 45)   # Increased from 20
+GLASS_DARK = QColor(255, 255, 255, 30)     # Increased from 12
+BORDER_LIGHT = QColor(255, 255, 255, 80)   # Increased from 50
+BORDER_MEDIUM = QColor(255, 255, 255, 60)  # Increased from 30
 
-class GlassTextEdit(QTextEdit):
-    """Modern text edit with Claude orange theme"""
+TEXT_PRIMARY = QColor(255, 255, 255, 255)
+TEXT_SECONDARY = QColor(255, 255, 255, 240)  # Increased from 220
+TEXT_TERTIARY = QColor(255, 255, 255, 200)   # Increased from 180
+TEXT_INPUT = QColor(255, 255, 255, 255)      # Increased from 240
+
+ACCENT_BLUE = QColor(0, 122, 255)
+SUCCESS_GREEN = QColor(48, 209, 88)
+ERROR_RED = QColor(255, 69, 58)
+WARNING_ORANGE = QColor(255, 159, 10)
+
+BG_PRIMARY = QColor(0, 0, 0, 180)    # Increased from 120
+BG_SECONDARY = QColor(0, 0, 0, 120)  # Increased from 80
+
+class AIWorkerThread(QThread):
+    """Enhanced AI processing thread with better timeout handling"""
+    
+    response_ready = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+    screenshot_captured = pyqtSignal()
+    status_update = pyqtSignal(str)
+    
+    def __init__(self, question, session_id, web_search_enabled=False, custom_instructions=""):
+        super().__init__()
+        self.question = question
+        self.session_id = session_id
+        self.web_search_enabled = web_search_enabled
+        self.custom_instructions = custom_instructions
+        self.retry_count = 0
+        self.max_retries = 2
+        
+    def run(self):
+        """Enhanced run with retry logic"""
+        for attempt in range(self.max_retries + 1):
+            try:
+                self.retry_count = attempt
+                if attempt > 0:
+                    print(f"🔄 Retry attempt {attempt}/{self.max_retries}")
+                    self.status_update.emit(f"Retrying... (attempt {attempt + 1})")
+                    time.sleep(1)  # Brief delay before retry
+                
+                return self._process_ai_request()
+                
+            except Exception as e:
+                error_msg = f"AI processing error (attempt {attempt + 1}): {str(e)}"
+                print(f"❌ {error_msg}")
+                
+                if attempt < self.max_retries:
+                    continue  # Try again
+                else:
+                    self.error_occurred.emit(f"Failed after {self.max_retries + 1} attempts: {str(e)}")
+                    return
+    
+    def _process_ai_request(self):
+        """Core AI processing logic"""
+        print(f"🔄 AI Worker Thread started for: {self.question}")
+        if self.custom_instructions:
+            print(f"🎯 Using custom instructions ({len(self.custom_instructions)} chars)")
+        
+        # Step 1: Screenshot capture with enhanced timeout
+        screenshot = None
+        if not self.web_search_enabled:
+            print("📸 Capturing screenshot...")
+            self.status_update.emit("Taking screenshot...")
+            
+            try:
+                screenshot = self._capture_screenshot_with_timeout(timeout=5)  # Increased timeout
+                if screenshot:
+                    size_kb = len(screenshot) / 1024
+                    print(f"✅ Screenshot: {size_kb:.1f}KB")
+                    self.screenshot_captured.emit()
+                else:
+                    print("⚠️ Screenshot capture failed, continuing without")
+            except Exception as e:
+                print(f"⚠️ Screenshot error: {e}, continuing without")
+        
+        # Step 2: Get context
+        self.status_update.emit("Getting context...")
+        from database import get_session_context
+        context = get_session_context(self.session_id)
+        
+        if context and len(context) > 500:
+            context = context[:500] + "..."
+        
+        # Step 3: Prepare question
+        api_question = self.question
+        if self.web_search_enabled:
+            api_question = f"[WEB_SEARCH] {self.question}"
+        
+        # Step 4: Enhanced AI call with custom instructions
+        print("🤖 Making AI call with custom instructions...")
+        self.status_update.emit("Getting AI response...")
+        
+        response = get_ai_response(
+            api_question, 
+            screenshot, 
+            context, 
+            None,  # No template_key
+            self.custom_instructions
+        )
+        
+        if isinstance(response, dict) and "error" in response:
+            print(f"❌ AI error: {response['error']}")
+            raise Exception(response["error"])
+            
+        print("✅ AI response received")
+        self.response_ready.emit((response, self.question))
+    
+    def _capture_screenshot_with_timeout(self, timeout=5):
+        """Enhanced screenshot capture with timeout"""
+        import queue
+        
+        screenshot_queue = queue.Queue()
+        
+        def screenshot_worker():
+            try:
+                result = capture_full_screen()
+                screenshot_queue.put(("success", result))
+            except Exception as e:
+                screenshot_queue.put(("error", str(e)))
+        
+        screenshot_thread = threading.Thread(target=screenshot_worker)
+        screenshot_thread.daemon = True
+        screenshot_thread.start()
+        
+        try:
+            result_type, result = screenshot_queue.get(timeout=timeout)
+            if result_type == "success":
+                return result
+            else:
+                raise Exception(result)
+        except queue.Empty:
+            print(f"⏰ Screenshot timeout after {timeout}s")
+            return None
+
+class SessionCustomInstructionsDialog(QDialog):
+    """Enhanced dialog for session-based custom instructions with improved layout"""
+    
+    def __init__(self, parent=None, session_id=None):
+        super().__init__(parent)
+        self.session_id = session_id
+        self.current_instructions = ""
+        self.is_locked = False
+        self.setup_ui()
+        self.load_current_instructions()
+        
+    def setup_ui(self):
+        self.setWindowTitle("Custom Instructions")
+        self.setFixedSize(540, 450)  # Slightly smaller height
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
+        # Center the dialog
+        screen = QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            int(screen.height() * 0.15)
+        )
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Enhanced main container with clean background
+        self.main_widget = QWidget()
+        self.main_widget.setStyleSheet(f"""
+            QWidget {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(30, 30, 30, 250),
+                    stop: 1 rgba(20, 20, 20, 240));
+                border-radius: 16px;
+                border: 1px solid rgba(255, 255, 255, 100);
+            }}
+        """)
+        layout.addWidget(self.main_widget)
+        
+        content_layout = QVBoxLayout(self.main_widget)
+        content_layout.setSpacing(20)
+        content_layout.setContentsMargins(30, 25, 30, 25)
+        
+        # Clean header with close button
+        header_layout = QHBoxLayout()
+        
+        # Title section - simplified
+        title = QLabel("🎯 Custom Instructions")
+        title.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 255);
+                font-size: 22px;
+                font-weight: 600;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        header_layout.addWidget(title)
+        
+        header_layout.addStretch()
+        
+        # Close button
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 69, 58, 200);
+                border: none;
+                border-radius: 14px;
+                color: white;
+                font-size: 18px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 69, 58, 255);
+            }}
+        """)
+        close_btn.clicked.connect(self.reject)
+        header_layout.addWidget(close_btn)
+        
+        content_layout.addLayout(header_layout)
+        
+        # Enhanced description
+        desc_label = QLabel("Configure AI behavior for this session. Instructions will be locked after your first interaction to maintain consistency.")
+        desc_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 200);
+                font-size: 14px;
+                font-weight: 400;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                line-height: 1.5;
+                background: transparent;
+                border: none;
+                margin-bottom: 5px;
+            }}
+        """)
+        desc_label.setWordWrap(True)
+        content_layout.addWidget(desc_label)
+        
+        # Session info with lock status
+        info_layout = QHBoxLayout()
+        if self.session_id:
+            session_info = get_session_info(self.session_id)
+            if session_info:
+                session_label = QLabel(f"Session: {session_info['name']}")
+                session_label.setStyleSheet(f"""
+                    QLabel {{
+                        color: rgba(0, 122, 255, 255);
+                        font-size: 13px;
+                        font-weight: 500;
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                        background: transparent;
+                        border: none;
+                    }}
+                """)
+                info_layout.addWidget(session_label)
+        
+        info_layout.addStretch()
+        
+        # Lock status indicator
+        self.lock_indicator = QLabel("")
+        self.lock_indicator.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 159, 10, 255);
+                font-size: 12px;
+                font-weight: 600;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                background: rgba(255, 159, 10, 20);
+                padding: 4px 8px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 159, 10, 60);
+            }}
+        """)
+        info_layout.addWidget(self.lock_indicator)
+        
+        content_layout.addLayout(info_layout)
+        
+        # Custom instructions text area with clear label
+        instructions_label = QLabel("Instructions")
+        instructions_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 240);
+                font-size: 15px;
+                font-weight: 600;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                background: transparent;
+                border: none;
+                margin-bottom: 8px;
+            }}
+        """)
+        content_layout.addWidget(instructions_label)
+        
+        self.instructions_input = QTextEdit()
+        self.instructions_input.setPlaceholderText("Enter custom instructions here...\n\nExample:\n• Respond as a senior developer\n• Focus on best practices\n• Include error handling in code\n• Prefer Python solutions")
+        self.instructions_input.setMinimumHeight(140)
+        self.instructions_input.setMaximumHeight(140)
+        self.instructions_input.setStyleSheet(f"""
+            QTextEdit {{
+                background: rgba(40, 40, 40, 200);
+                border: 2px solid rgba(255, 255, 255, 100);
+                border-radius: 12px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                padding: 15px;
+                selection-background-color: rgba(0, 122, 255, 80);
+                line-height: 1.4;
+            }}
+            QTextEdit:focus {{
+                border: 2px solid rgba(0, 122, 255, 150);
+                background: rgba(45, 45, 45, 220);
+            }}
+        """)
+        content_layout.addWidget(self.instructions_input)
+        
+        # Character count and status
+        bottom_info_layout = QHBoxLayout()
+        self.char_count_label = QLabel("0 characters")
+        self.char_count_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 160);
+                font-size: 12px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            }}
+        """)
+        self.instructions_input.textChanged.connect(self.update_char_count)
+        bottom_info_layout.addWidget(self.char_count_label)
+        
+        bottom_info_layout.addStretch()
+        
+        # Status message
+        self.status_message = QLabel("")
+        self.status_message.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 159, 10, 255);
+                font-size: 12px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+            }}
+        """)
+        bottom_info_layout.addWidget(self.status_message)
+        
+        content_layout.addLayout(bottom_info_layout)
+        
+        # Action buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(15)
+        
+        clear_btn = QPushButton("Clear")
+        clear_btn.setMinimumHeight(40)
+        clear_btn.setMinimumWidth(80)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 30);
+                border: 1px solid rgba(255, 255, 255, 80);
+                border-radius: 10px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+                padding: 12px 20px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 255, 255, 40);
+            }}
+            QPushButton:disabled {{
+                background: rgba(255, 255, 255, 10);
+                color: rgba(255, 255, 255, 100);
+                border: 1px solid rgba(255, 255, 255, 30);
+            }}
+        """)
+        clear_btn.clicked.connect(self.clear_instructions)
+        
+        save_btn = QPushButton("Save Instructions")
+        save_btn.setMinimumHeight(40)
+        save_btn.setMinimumWidth(160)
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(0, 122, 255, 255);
+                border: 1px solid rgba(0, 122, 255, 255);
+                border-radius: 10px;
+                color: white;
+                font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 600;
+                padding: 12px 20px;
+            }}
+            QPushButton:hover {{
+                background: rgba(0, 122, 255, 230);
+            }}
+            QPushButton:disabled {{
+                background: rgba(100, 100, 100, 150);
+                border: 1px solid rgba(100, 100, 100, 150);
+                color: rgba(255, 255, 255, 150);
+            }}
+        """)
+        save_btn.clicked.connect(self.save_instructions)
+        
+        # Store buttons for enabling/disabling
+        self.clear_btn = clear_btn
+        self.save_btn = save_btn
+        
+        button_layout.addWidget(clear_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(save_btn)
+        content_layout.addLayout(button_layout)
+        
+    def load_current_instructions(self):
+        """Load current instructions and check lock status"""
+        if self.session_id:
+            instructions = get_session_custom_instructions(self.session_id)
+            self.current_instructions = instructions
+            self.instructions_input.setPlainText(instructions)
+            self.update_char_count()
+            
+            # Check if session has any interactions (which would indicate locked state)
+            from database import get_session_history
+            history = get_session_history(self.session_id, limit=1)
+            self.is_locked = len(history) > 0 and bool(instructions)
+            
+            self.update_lock_status()
+            
+    def update_lock_status(self):
+        """Update lock status indicators"""
+        if self.is_locked:
+            self.lock_indicator.setText("🔒 LOCKED")
+            self.status_message.setText("Instructions are locked after first interaction")
+            self.instructions_input.setReadOnly(True)
+            self.clear_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            self.instructions_input.setStyleSheet(self.instructions_input.styleSheet() + """
+                QTextEdit { 
+                    background: rgba(30, 30, 30, 120); 
+                    border: 2px solid rgba(255, 255, 255, 50);
+                    color: rgba(255, 255, 255, 200);
+                }
+            """)
+        else:
+            self.lock_indicator.setText("")
+            self.status_message.setText("")
+            self.instructions_input.setReadOnly(False)
+            self.clear_btn.setEnabled(True)
+            self.save_btn.setEnabled(True)
+            
+    def update_char_count(self):
+        """Update character count"""
+        text = self.instructions_input.toPlainText()
+        count = len(text)
+        self.char_count_label.setText(f"{count} characters")
+        
+        # Change color based on length
+        if count > 3000:
+            color = "rgba(255, 69, 58, 255)"  # Red for very long
+        elif count > 2000:
+            color = "rgba(255, 159, 10, 255)"  # Orange for long
+        else:
+            color = "rgba(255, 255, 255, 160)"  # Default
+            
+        self.char_count_label.setStyleSheet(f"""
+            QLabel {{
+                color: {color};
+                font-size: 12px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            }}
+        """)
+            
+    def clear_instructions(self):
+        """Clear instructions if not locked"""
+        if not self.is_locked:
+            self.instructions_input.clear()
+        
+    def save_instructions(self):
+        """Save instructions if not locked"""
+        if self.is_locked:
+            return
+            
+        instructions = self.instructions_input.toPlainText().strip()
+        
+        if self.session_id:
+            save_session_custom_instructions(self.session_id, instructions)
+            print(f"💾 Saved custom instructions for session {self.session_id}")
+        
+        self.current_instructions = instructions
+        self.accept()
+        
+    def get_instructions(self):
+        """Get current instructions"""
+        return self.current_instructions
+
+class CustomInstructionsButton(QPushButton):
+    """Enhanced custom instructions button"""
+    
+    instructions_changed = pyqtSignal(str)
+    
+    def __init__(self, session_id=None):
+        super().__init__("🎯")
+        self.session_id = session_id
+        self.current_instructions = ""
+        self.is_locked = False
+        self.setup_ui()
+        self.load_instructions()
+        
+    def setup_ui(self):
+        self.setFixedSize(28, 28)
+        self.setToolTip("Custom Instructions")
+        self.update_button_appearance()
+        self.clicked.connect(self.show_instructions_dialog)
+        
+    def update_session(self, session_id):
+        """Update session and reload instructions"""
+        self.session_id = session_id
+        self.load_instructions()
+        
+    def load_instructions(self):
+        """Load instructions and check lock status"""
+        if self.session_id:
+            instructions = get_session_custom_instructions(self.session_id)
+            self.current_instructions = instructions
+            
+            # Check lock status
+            from database import get_session_history
+            history = get_session_history(self.session_id, limit=1)
+            self.is_locked = len(history) > 0 and bool(instructions)
+            
+            self.update_button_appearance()
+            
+    def show_instructions_dialog(self):
+        """Show custom instructions dialog"""
+        if not self.session_id:
+            print("❌ No session ID available")
+            return
+            
+        dialog = SessionCustomInstructionsDialog(self.parent(), self.session_id)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            instructions = dialog.get_instructions()
+            self.current_instructions = instructions
+            self.update_button_appearance()
+            
+            # Emit change signal
+            self.instructions_changed.emit(instructions)
+            
+            print(f"🎯 Custom instructions updated for session {self.session_id}")
+            
+    def update_button_appearance(self):
+        """Enhanced button appearance"""
+        if self.current_instructions:
+            if self.is_locked:
+                # Locked instructions - orange
+                self.setStyleSheet(f"""
+                    QPushButton {{
+                        background: rgba(255, 159, 10, 120);
+                        border: 1px solid rgba(255, 159, 10, 180);
+                        border-radius: 14px;
+                        color: white;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }}
+                    QPushButton:hover {{
+                        background: rgba(255, 159, 10, 140);
+                        border: 1px solid rgba(255, 159, 10, 200);
+                    }}
+                """)
+                self.setToolTip(f"🔒 Custom Instructions Locked ({len(self.current_instructions)} chars)")
+            else:
+                # Active but unlocked instructions - blue
+                self.setStyleSheet(f"""
+                    QPushButton {{
+                        background: rgba(0, 122, 255, 120);
+                        border: 1px solid rgba(0, 122, 255, 180);
+                        border-radius: 14px;
+                        color: white;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }}
+                    QPushButton:hover {{
+                        background: rgba(0, 122, 255, 140);
+                        border: 1px solid rgba(0, 122, 255, 200);
+                    }}
+                """)
+                self.setToolTip(f"🎯 Custom Instructions Active ({len(self.current_instructions)} chars)")
+        else:
+            # Default appearance
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(40, 40, 40, 150);
+                    border: 1px solid rgba(255, 255, 255, 60);
+                    border-radius: 14px;
+                    color: rgba(255, 255, 255, 255);
+                    font-size: 14px;
+                    font-weight: 500;
+                }}
+                QPushButton:hover {{
+                    background: rgba(0, 122, 255, 80);
+                    border: 1px solid rgba(0, 122, 255, 120);
+                }}
+            """)
+            self.setToolTip("Custom Instructions")
+    
+    def get_current_instructions(self):
+        """Get current instructions"""
+        return self.current_instructions
+
+class FastBlurWidget(QWidget):
+    """Enhanced widget with higher opacity"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+    def paintEvent(self, event):
+        """Enhanced paint event with higher opacity"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Enhanced gradient background with higher opacity
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0, QColor(25, 25, 25, 180))   # Increased opacity
+        gradient.setColorAt(1, QColor(15, 15, 15, 160))   # Increased opacity
+        
+        painter.setBrush(QBrush(gradient))
+        painter.setPen(QPen(QColor(255, 255, 255, 80), 1))  # Enhanced border
+        
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.drawRoundedRect(rect, 12, 12)
+
+class EnhancedTextEdit(QTextEdit):
+    """Enhanced text edit with fixed hotkey handling"""
     
     enterPressed = pyqtSignal()
+    webSearchToggled = pyqtSignal(bool)
+    emptyEnterPressed = pyqtSignal()
     
     def __init__(self, placeholder=""):
         super().__init__()
         self.setPlaceholderText(placeholder)
-        self.setMaximumHeight(100)
-        self.setStyleSheet(f"""
-            QTextEdit {{
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 107, 53, 0.3);
-                border-radius: 16px;
+        self.base_height = 56
+        self.line_height = 26
+        self.max_lines = 3
+        self.web_search_enabled = False
+        self.input_mode_active = False  # Track if we're in input mode
+        self.ignore_enter_until = 0  # Timestamp to ignore Enter keys until
+        
+        self.setMaximumHeight(self.base_height)
+        self.setMinimumHeight(self.base_height)
+        self.setStyleSheet(self.get_enhanced_style())
+        
+        self.setup_placeholder_handling()
+        
+        self.height_animation = QPropertyAnimation(self, b"maximumHeight")
+        self.height_animation.setDuration(150)
+        self.height_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
+        self.textChanged.connect(self.fast_height_adjustment)
+        self.setup_web_search_button()
+        
+    def set_input_mode(self, active):
+        """Set whether we're in active input mode"""
+        self.input_mode_active = active
+        if active:
+            # When entering input mode, ignore Enter keys for a short time
+            # to prevent global hotkey from being processed by this widget
+            import time
+            self.ignore_enter_until = time.time() + 0.2  # 200ms protection
+        
+    def setup_placeholder_handling(self):
+        """Setup placeholder with better positioning"""
+        self.placeholder_label = QLabel(self.placeholderText(), self)
+        self.placeholder_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 180);
+                font-size: 13px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        self.placeholder_label.move(22, 20)
+        self.placeholder_label.show()
+        self.textChanged.connect(self.update_placeholder_visibility)
+        
+    def update_placeholder_visibility(self):
+        """Update placeholder visibility"""
+        if self.toPlainText().strip():
+            self.placeholder_label.hide()
+        else:
+            self.placeholder_label.show()
+            
+    def resizeEvent(self, event):
+        """Handle resize"""
+        super().resizeEvent(event)
+        if hasattr(self, 'web_search_btn'):
+            self.position_web_search_button()
+        if hasattr(self, 'placeholder_label'):
+            self.placeholder_label.move(22, 20)
+        
+    def setup_web_search_button(self):
+        """Setup web search button"""
+        self.web_search_btn = QPushButton("🌐", self)
+        self.web_search_btn.setFixedSize(28, 28)
+        self.web_search_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 25);
+                border: 1px solid rgba(255, 255, 255, 50);
+                border-radius: 14px;
+                color: rgba(255, 255, 255, 200);
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background: rgba(0, 122, 255, 50);
+                border: 1px solid rgba(0, 122, 255, 120);
+                color: rgba(0, 122, 255, 255);
+            }}
+            QPushButton:checked {{
+                background: rgba(0, 122, 255, 120);
+                border: 1px solid rgba(0, 122, 255, 180);
                 color: white;
+            }}
+        """)
+        self.web_search_btn.setCheckable(True)
+        self.web_search_btn.clicked.connect(self.toggle_web_search)
+        self.web_search_btn.setToolTip("Toggle web search")
+        self.position_web_search_button()
+        
+    def position_web_search_button(self):
+        """Position web search button"""
+        button_x = self.width() - self.web_search_btn.width() - 15
+        button_y = (self.height() - self.web_search_btn.height()) // 2
+        self.web_search_btn.move(button_x, button_y)
+        
+    def toggle_web_search(self):
+        """Toggle web search"""
+        self.web_search_enabled = self.web_search_btn.isChecked()
+        self.webSearchToggled.emit(self.web_search_enabled)
+        print(f"🌐 Web search: {'Enabled' if self.web_search_enabled else 'Disabled'}")
+        
+    def get_enhanced_style(self):
+        """Enhanced input styling with higher opacity"""
+        return f"""
+            QTextEdit {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(255, 255, 255, 40),
+                    stop: 0.5 rgba(255, 255, 255, 30),
+                    stop: 1 rgba(255, 255, 255, 20));
+                border: 2px solid rgba(255, 255, 255, 120);
+                border-radius: 18px;
+                color: rgba(255, 255, 255, 255);
                 font-size: 15px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 400;
-                padding: 16px 20px;
-                selection-background-color: rgba(255, 107, 53, 0.3);
+                font-weight: 600;
+                padding: 20px 50px 16px 22px;
+                selection-background-color: rgba(0, 122, 255, 80);
                 line-height: 1.4;
             }}
             QTextEdit:focus {{
-                border: 1px solid rgba(255, 107, 53, 0.5);
-                background: rgba(255, 255, 255, 0.08);
+                border: 2px solid rgba(0, 122, 255, 200);
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(255, 255, 255, 50),
+                    stop: 0.5 rgba(255, 255, 255, 40),
+                    stop: 1 rgba(255, 255, 255, 30));
+                color: rgba(255, 255, 255, 255);
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                border-radius: 3px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 80);
+                border-radius: 3px;
+                min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: rgba(255, 255, 255, 100);
+            }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {{
+                height: 0px;
+                background: transparent;
+            }}
+            QScrollBar:horizontal {{
+                height: 0px;
+            }}
+        """
+        
+    def fast_height_adjustment(self):
+        """Fast height adjustment"""
+        doc = self.document()
+        doc.setTextWidth(self.width() - 65)
+        content_height = int(doc.size().height())
+        
+        lines = max(1, content_height // self.line_height)
+        
+        if lines <= self.max_lines:
+            new_height = self.base_height + (lines - 1) * self.line_height
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        else:
+            new_height = self.base_height + (self.max_lines - 1) * self.line_height
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        if new_height != self.maximumHeight():
+            self.height_animation.setStartValue(self.maximumHeight())
+            self.height_animation.setEndValue(new_height)
+            self.height_animation.start()
+            self.setMinimumHeight(new_height)
+        
+    def keyPressEvent(self, event):
+        """Fixed key press event - only handle Enter when in input mode and not during hotkey protection"""
+        if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            # Check if we should ignore Enter keys (hotkey protection)
+            import time
+            current_time = time.time()
+            if current_time < self.ignore_enter_until:
+                print(f"🔒 Ignoring Enter key during hotkey protection ({self.ignore_enter_until - current_time:.2f}s remaining)")
+                return  # Ignore this Enter key
+            
+            # Only handle Enter key if we're actually in input mode and the widget has focus
+            if self.input_mode_active and self.hasFocus():
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    # Shift+Enter = new line
+                    super().keyPressEvent(event)
+                else:
+                    # Regular Enter = process
+                    if self.toPlainText().strip():
+                        print("📝 Processing typed question")
+                        self.enterPressed.emit()
+                    else:
+                        print("⚡ Processing empty enter (screen analysis)")
+                        self.emptyEnterPressed.emit()
+            else:
+                # Not in input mode, don't handle the key
+                super().keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
+    
+    def ensure_focus_immediately(self):
+        """Ensure focus is set immediately and visibly"""
+        print("🎯 Setting input mode and focus with hotkey protection")
+        self.set_input_mode(True)  # This now includes hotkey protection
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.activateWindow()
+        
+        # Multiple focus attempts for reliability
+        QTimer.singleShot(10, lambda: self.setFocus())
+        QTimer.singleShot(50, lambda: self.setFocus())
+        QTimer.singleShot(100, self.ensure_cursor_visible)
+        
+    def ensure_cursor_visible(self):
+        """Ensure cursor is visible and at end"""
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
+class LoadingWidget(QWidget):
+    """Enhanced loading widget"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(120)
+        self.dot_index = 0
+        self.web_search_enabled = False
+        
+        self.animation_timer = QTimer()
+        self.animation_timer.timeout.connect(self.update_animation)
+        self.animation_timer.start(500)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        self.header_label = QLabel("✨ AI ASSISTANT")
+        self.header_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(0, 122, 255, 255);
+                font-weight: 700;
+                font-size: 11px;
+                letter-spacing: 0.8px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            }}
+        """)
+        self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.header_label)
+        
+        dots_container = QWidget()
+        dots_layout = QHBoxLayout(dots_container)
+        dots_layout.setContentsMargins(0, 0, 0, 0)
+        dots_layout.setSpacing(8)
+        dots_layout.addStretch()
+        
+        self.dots = []
+        for i in range(3):
+            dot = QLabel("●")
+            dot.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(0, 122, 255, 120);
+                    font-size: 20px;
+                    font-weight: bold;
+                }}
+            """)
+            dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.dots.append(dot)
+            dots_layout.addWidget(dot)
+        
+        dots_layout.addStretch()
+        layout.addWidget(dots_container)
+        
+        self.status_label = QLabel("🔍 Analyzing your screen and preparing response...")
+        self.status_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(255, 255, 255, 240);
+                font-size: 14px;
+                font-weight: 500;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                line-height: 1.4;
+            }}
+        """)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        
+        self.setStyleSheet(f"""
+            LoadingWidget {{
+                background: rgba(25, 25, 25, 120);
+                border-radius: 12px;
+                border-left: 3px solid rgba(0, 122, 255, 120);
             }}
         """)
         
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                super().keyPressEvent(event)
-            else:
-                self.enterPressed.emit()
+    def set_web_search_mode(self, enabled):
+        """Set web search mode"""
+        self.web_search_enabled = enabled
+        if enabled:
+            self.status_label.setText("🌐 Searching web and analyzing...")
         else:
-            super().keyPressEvent(event)
+            self.status_label.setText("🔍 Analyzing your screen...")
+    
+    def set_status(self, status):
+        """Set custom status"""
+        self.status_label.setText(status)
+    
+    def update_animation(self):
+        """Update dot animation"""
+        for dot in self.dots:
+            dot.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(0, 122, 255, 120);
+                    font-size: 20px;
+                    font-weight: bold;
+                }}
+            """)
+        
+        if self.dot_index < len(self.dots):
+            self.dots[self.dot_index].setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(0, 122, 255, 255);
+                    font-size: 22px;
+                    font-weight: bold;
+                }}
+            """)
+        
+        self.dot_index = (self.dot_index + 1) % (len(self.dots) + 1)
+        
+    def stop_animation(self):
+        """Stop animation"""
+        if self.animation_timer:
+            self.animation_timer.stop()
+        
+    def start_animation(self):
+        """Start animation"""
+        if self.animation_timer and not self.animation_timer.isActive():
+            self.animation_timer.start(500)
 
-class ModernAPIDialog(QDialog):
-    """Clean, properly sized API key setup dialog"""
+class EnhancedResponseDisplay(QTextBrowser):
+    """Enhanced response display with better styling"""
+    
+    copyRequested = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.full_text = ""
+        self.current_index = 0
+        self.typing_speed = 8
+        self.is_typing = False
+        
+        self.min_height = 120
+        self.max_height_ratio = 0.6
+        
+        self.setStyleSheet(self.get_enhanced_style())
+        self.setOpenExternalLinks(True)
+        
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+        self.height_animation = QPropertyAnimation(self, b"maximumHeight")
+        self.height_animation.setDuration(200)
+        self.height_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
+    def get_enhanced_style(self):
+        """Enhanced styling with higher opacity"""
+        return f"""
+            QTextBrowser {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(25, 25, 25, 200),
+                    stop: 0.5 rgba(20, 20, 20, 180),
+                    stop: 1 rgba(15, 15, 15, 160));
+                border: 1px solid rgba(255, 255, 255, 60);
+                border-radius: 16px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 400;
+                padding: 20px;
+                line-height: 1.6;
+                selection-background-color: rgba(0, 122, 255, 80);
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                border-radius: 3px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 70);
+                border-radius: 3px;
+                min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: rgba(255, 255, 255, 90);
+            }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {{
+                height: 0px;
+                background: transparent;
+            }}
+        """
+        
+    def show_context_menu(self, position):
+        """Show context menu"""
+        menu = QMenu(self)
+        
+        if self.textCursor().hasSelection():
+            copy_action = menu.addAction("Copy Selected Text")
+            copy_action.triggered.connect(lambda: self.copy_to_clipboard(self.textCursor().selectedText()))
+        
+        copy_all_action = menu.addAction("Copy All Content")
+        copy_all_action.triggered.connect(lambda: self.copy_to_clipboard(self.toPlainText()))
+        
+        if menu.actions():
+            menu.exec(self.mapToGlobal(position))
+    
+    def copy_to_clipboard(self, text):
+        """Copy to clipboard"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        print(f"📋 Copied: {len(text)} characters")
+        
+    def smart_height_adjustment(self):
+        """Smart height adjustment"""
+        doc = self.document()
+        doc.setTextWidth(self.width() - 40)
+        content_height = int(doc.size().height() + 40)
+        
+        screen_height = QApplication.primaryScreen().geometry().height()
+        max_height = int(screen_height * self.max_height_ratio)
+        new_height = max(self.min_height, min(content_height, max_height))
+        
+        if new_height != self.maximumHeight():
+            self.height_animation.setStartValue(self.maximumHeight())
+            self.height_animation.setEndValue(new_height)
+            self.height_animation.start()
+            self.setMinimumHeight(new_height)
+        
+        if content_height > max_height:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            
+    def typewrite_text(self, html_text):
+        """Typewriter effect"""
+        self.clear()
+        self.full_text = html_text
+        self.current_index = 0
+        self.is_typing = True
+        QTimer.singleShot(self.typing_speed, self.add_next_chunk)
+        
+    def add_next_chunk(self):
+        """Add text chunks"""
+        if not self.is_typing:
+            return
+            
+        if self.current_index < len(self.full_text):
+            chunk_size = 15
+            end_index = min(self.current_index + chunk_size, len(self.full_text))
+            partial_text = self.full_text[:end_index]
+            self.setHtml(partial_text)
+            self.current_index = end_index
+            
+            if self.current_index % 300 == 0:
+                self.smart_height_adjustment()
+            
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(cursor)
+            
+            QTimer.singleShot(self.typing_speed, self.add_next_chunk)
+        else:
+            self.is_typing = False
+            self.smart_height_adjustment()
+            
+    def show_immediately(self, html_text):
+        """Show text immediately"""
+        self.setHtml(html_text)
+        QTimer.singleShot(50, self.smart_height_adjustment)
+
+class QuestionDisplay(QWidget):
+    """Enhanced question display widget"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("background: transparent;")
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup UI"""
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        
+        self.content_widget = QWidget()
+        self.content_widget.setStyleSheet("background: transparent;")
+        content_layout = QVBoxLayout(self.content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(4)
+        
+        self.content_label = QLabel()
+        self.content_label.setStyleSheet(f"""
+            QLabel {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(0, 122, 255, 40),
+                    stop: 1 rgba(0, 122, 255, 25));
+                border: 1px solid rgba(0, 122, 255, 80);
+                border-radius: 12px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+                padding: 12px 16px;
+                line-height: 1.4;
+            }}
+        """)
+        self.content_label.setWordWrap(True)
+        content_layout.addWidget(self.content_label)
+        
+        layout.addWidget(self.content_widget, 1)
+        
+        self.header_label = QLabel("YOUR QUESTION")
+        self.header_label.setStyleSheet(f"""
+            QLabel {{
+                color: rgba(0, 122, 255, 255);
+                font-size: 10px;
+                font-weight: 700;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                letter-spacing: 0.5px;
+                padding: 4px 8px;
+                background: rgba(0, 122, 255, 20);
+                border-radius: 6px;
+                border: 1px solid rgba(0, 122, 255, 50);
+                min-width: 80px;
+                max-width: 120px;
+            }}
+        """)
+        self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.header_label, 0)
+        
+        self.hide()
+        
+    def set_question(self, question, web_search_enabled=False, has_custom_instructions=False):
+        """Set question with enhanced indicators"""
+        if has_custom_instructions:
+            header_text = "🎯 CUSTOM QUESTION"
+            # Use orange for custom instructions
+            self.content_label.setStyleSheet(f"""
+                QLabel {{
+                    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                        stop: 0 rgba(255, 159, 10, 40),
+                        stop: 1 rgba(255, 159, 10, 25));
+                    border: 1px solid rgba(255, 159, 10, 80);
+                    border-radius: 12px;
+                    color: rgba(255, 255, 255, 255);
+                    font-size: 14px;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                    font-weight: 500;
+                    padding: 12px 16px;
+                    line-height: 1.4;
+                }}
+            """)
+            self.header_label.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(255, 159, 10, 255);
+                    font-size: 10px;
+                    font-weight: 700;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 0.5px;
+                    padding: 4px 8px;
+                    background: rgba(255, 159, 10, 20);
+                    border-radius: 6px;
+                    border: 1px solid rgba(255, 159, 10, 50);
+                    min-width: 80px;
+                    max-width: 120px;
+                }}
+            """)
+        elif web_search_enabled:
+            header_text = "🌐 WEB SEARCH"
+        else:
+            header_text = "YOUR QUESTION"
+            # Reset to blue for normal questions
+            self.content_label.setStyleSheet(f"""
+                QLabel {{
+                    background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                        stop: 0 rgba(0, 122, 255, 40),
+                        stop: 1 rgba(0, 122, 255, 25));
+                    border: 1px solid rgba(0, 122, 255, 80);
+                    border-radius: 12px;
+                    color: rgba(255, 255, 255, 255);
+                    font-size: 14px;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                    font-weight: 500;
+                    padding: 12px 16px;
+                    line-height: 1.4;
+                }}
+            """)
+            self.header_label.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(0, 122, 255, 255);
+                    font-size: 10px;
+                    font-weight: 700;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                    letter-spacing: 0.5px;
+                    padding: 4px 8px;
+                    background: rgba(0, 122, 255, 20);
+                    border-radius: 6px;
+                    border: 1px solid rgba(0, 122, 255, 50);
+                    min-width: 80px;
+                    max-width: 120px;
+                }}
+            """)
+            
+        self.header_label.setText(header_text)
+        self.content_label.setText(question)
+        self.show()
+        
+    def clear_question(self):
+        """Clear question"""
+        self.content_label.clear()
+        self.hide()
+
+class CompactInstructionBar(QWidget):
+    """Enhanced instruction bar"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("background: transparent;")
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup UI"""
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        
+        instructions = [
+            ("Ask", "Ctrl ↵"),
+            ("Show/Hide", "Ctrl \\"),
+        ]
+        
+        for i, (label, shortcut) in enumerate(instructions):
+            item_widget = QWidget()
+            item_layout = QHBoxLayout(item_widget)
+            item_layout.setContentsMargins(10, 5, 10, 5)
+            item_layout.setSpacing(6)
+            
+            label_widget = QLabel(label)
+            label_widget.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(255, 255, 255, 220);
+                    font-size: 11px;
+                    font-weight: 500;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                }}
+            """)
+            item_layout.addWidget(label_widget)
+            
+            shortcut_widget = QLabel(shortcut)
+            shortcut_widget.setStyleSheet(f"""
+                QLabel {{
+                    color: rgba(255, 255, 255, 180);
+                    font-size: 10px;
+                    font-weight: 400;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                    background: rgba(255, 255, 255, 15);
+                    border-radius: 3px;
+                    padding: 2px 6px;
+                }}
+            """)
+            item_layout.addWidget(shortcut_widget)
+            
+            item_widget.setStyleSheet(f"""
+                QWidget {{
+                    background: rgba(40, 40, 40, 80);
+                    border-radius: 8px;
+                    border: 1px solid rgba(255, 255, 255, 20);
+                    min-width: 80px;
+                }}
+            """)
+            
+            layout.addWidget(item_widget)
+            
+            if i < len(instructions) - 1:
+                separator = QLabel("•")
+                separator.setStyleSheet(f"""
+                    QLabel {{
+                        color: rgba(255, 255, 255, 60);
+                        font-size: 8px;
+                        padding: 0 3px;
+                    }}
+                """)
+                layout.addWidget(separator)
+
+class OptimizedDropdown(QComboBox):
+    """Enhanced dropdown with better styling"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setMinimumWidth(140)
+        self.setMaximumWidth(200)
+        self.setStyleSheet(self.get_optimized_style())
+        
+    def get_optimized_style(self):
+        """Enhanced dropdown styling"""
+        return f"""
+            QComboBox {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(40, 40, 40, 200),
+                    stop: 0.5 rgba(35, 35, 35, 180),
+                    stop: 1 rgba(30, 30, 30, 160));
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 10px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 13px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+                padding: 8px 12px;
+            }}
+            QComboBox:hover {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(50, 50, 50, 220),
+                    stop: 0.5 rgba(45, 45, 45, 200),
+                    stop: 1 rgba(40, 40, 40, 180));
+                border: 1px solid rgba(255, 255, 255, 90);
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border: none;
+                width: 0;
+                height: 0;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid rgba(255, 255, 255, 220);
+                margin-right: 4px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(35, 35, 35, 250),
+                    stop: 1 rgba(25, 25, 25, 240));
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 12px;
+                color: rgba(255, 255, 255, 255);
+                selection-background-color: rgba(0, 122, 255, 80);
+                outline: none;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 8px 12px;
+                border: none;
+                border-radius: 6px;
+                margin: 2px;
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background: rgba(0, 122, 255, 100);
+                color: white;
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background: rgba(255, 255, 255, 30);
+            }}
+        """
+
+class FixedAPIDialog(QDialog):
+    """Enhanced API setup dialog"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,197 +1447,180 @@ class ModernAPIDialog(QDialog):
         self.setup_ui()
         
     def setup_ui(self):
-        self.setWindowTitle("AI Brain Setup")
-        self.setFixedSize(500, 400)
+        self.setWindowTitle("API Setup")
+        self.setFixedSize(420, 320)
         self.setModal(True)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        # Main layout
+        # Center the dialog
+        screen = QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            int(screen.height() * 0.15)
+        )
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Main container with clean styling
-        main_widget = QWidget()
-        main_widget.setStyleSheet("""
-            QWidget {
-                background: rgba(45, 45, 45, 0.98);
-                border-radius: 20px;
-                border: 1px solid rgba(255, 107, 53, 0.2);
-            }
+        self.main_widget = FastBlurWidget()
+        layout.addWidget(self.main_widget)
+        
+        content_layout = QVBoxLayout(self.main_widget)
+        content_layout.setSpacing(20)
+        content_layout.setContentsMargins(30, 25, 30, 25)
+        
+        header_layout = QHBoxLayout()
+        
+        title_section = QVBoxLayout()
+        title_section.setSpacing(8)
+        
+        title_container = QHBoxLayout()
+        title_container.addStretch()
+        
+        icon = QLabel("🔑")
+        icon.setStyleSheet("font-size: 28px; color: rgba(0, 122, 255, 255);")
+        title_container.addWidget(icon)
+        
+        title = QLabel("API Key")
+        title.setStyleSheet(f"""
+            color: rgba(255, 255, 255, 255);
+            font-size: 20px;
+            font-weight: 600;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            margin-left: 10px;
         """)
-        layout.addWidget(main_widget)
+        title_container.addWidget(title)
+        title_container.addStretch()
         
-        # Content layout
-        content_layout = QVBoxLayout(main_widget)
-        content_layout.setSpacing(30)
-        content_layout.setContentsMargins(50, 50, 50, 50)
+        title_section.addLayout(title_container)
         
-        # Logo/Icon area
-        icon_layout = QHBoxLayout()
-        icon_layout.addStretch()
-        
-        # Logo placeholder
-        logo_label = QLabel("🧠")
-        logo_label.setStyleSheet(f"""
-            QLabel {{
-                color: {CLAUDE_ORANGE};
-                font-size: 52px;
-                background: transparent;
-                border: none;
-            }}
-        """)
-        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_layout.addWidget(logo_label)
-        
-        icon_layout.addStretch()
-        content_layout.addLayout(icon_layout)
-        
-        # Header
-        header = QLabel("AI Brain")
-        header.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 32px;
-                font-weight: 600;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                letter-spacing: -0.5px;
-                background: transparent;
-                border: none;
-            }
-        """)
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content_layout.addWidget(header)
-        
-        # Subtitle
-        subtitle = QLabel("Enter your OpenAI API key to get started")
-        subtitle.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.8);
-                font-size: 18px;
-                font-weight: 400;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                background: transparent;
-                border: none;
-            }
+        subtitle = QLabel("Enter your OpenAI API key")
+        subtitle.setStyleSheet(f"""
+            color: rgba(255, 255, 255, 220);
+            font-size: 14px;
+            font-weight: 400;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
         """)
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content_layout.addWidget(subtitle)
+        title_section.addWidget(subtitle)
         
-        # API Key input
-        self.api_input = QLineEdit()
-        self.api_input.setPlaceholderText("sk-...")
-        self.api_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_input.setMinimumHeight(50)
-        self.api_input.setStyleSheet(f"""
-            QLineEdit {{
-                background: rgba(255, 255, 255, 0.08);
-                border: 2px solid rgba(255, 107, 53, 0.3);
+        header_layout.addLayout(title_section)
+        
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 69, 58, 200);
+                border: none;
                 border-radius: 12px;
                 color: white;
                 font-size: 16px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 69, 58, 255);
+            }}
+        """)
+        close_btn.clicked.connect(self.reject)
+        header_layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+        
+        content_layout.addLayout(header_layout)
+        
+        self.api_input = QLineEdit()
+        self.api_input.setPlaceholderText("sk-...")
+        self.api_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_input.setMinimumHeight(40)
+        self.api_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: rgba(40, 40, 40, 180);
+                border: 2px solid rgba(255, 255, 255, 80);
+                border-radius: 10px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
                 font-weight: 400;
-                padding: 15px 20px;
-                selection-background-color: rgba(255, 107, 53, 0.3);
+                padding: 12px 16px;
+                selection-background-color: rgba(0, 122, 255, 80);
             }}
             QLineEdit:focus {{
-                border: 2px solid rgba(255, 107, 53, 0.6);
-                background: rgba(255, 255, 255, 0.12);
+                border: 2px solid rgba(0, 122, 255, 150);
+                background: rgba(45, 45, 45, 200);
             }}
         """)
         content_layout.addWidget(self.api_input)
         
-        # Show/Hide toggle
-        self.show_key_checkbox = QCheckBox("Show API key")
+        self.show_key_checkbox = QCheckBox("Show key")
         self.show_key_checkbox.setStyleSheet(f"""
             QCheckBox {{
-                color: rgba(255, 255, 255, 0.8);
-                font-size: 15px;
+                color: rgba(255, 255, 255, 200);
+                font-size: 12px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
                 font-weight: 400;
-                spacing: 10px;
-                background: transparent;
-                border: none;
+                spacing: 8px;
             }}
             QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border-radius: 4px;
-                border: 2px solid rgba(255, 107, 53, 0.5);
-                background: rgba(255, 255, 255, 0.05);
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                border: 1px solid rgba(255, 255, 255, 180);
+                background: transparent;
             }}
             QCheckBox::indicator:checked {{
-                background: {CLAUDE_ORANGE};
-                border: 2px solid {CLAUDE_ORANGE};
+                background: rgba(0, 122, 255, 255);
+                border: 1px solid rgba(0, 122, 255, 255);
             }}
         """)
         self.show_key_checkbox.toggled.connect(self.toggle_password_visibility)
         content_layout.addWidget(self.show_key_checkbox)
         
-        # Status
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 100, 100, 0.9);
-                font-size: 14px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 400;
-                background: transparent;
-                border: none;
-            }
+        self.status_label.setStyleSheet(f"""
+            color: rgba(255, 69, 58, 255);
+            font-size: 12px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-weight: 400;
         """)
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         content_layout.addWidget(self.status_label)
         
-        # Buttons
         button_layout = QHBoxLayout()
-        button_layout.setSpacing(15)
+        button_layout.setSpacing(12)
         
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setMinimumHeight(45)
-        self.cancel_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(255, 255, 255, 0.06);
-                border: 2px solid rgba(255, 255, 255, 0.15);
-                border-radius: 12px;
-                color: white;
-                font-size: 16px;
+        self.cancel_btn.setMinimumHeight(36)
+        self.cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 255, 255, 25);
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 14px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
                 font-weight: 500;
-                padding: 12px 30px;
-                min-width: 120px;
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.1);
-                border: 2px solid rgba(255, 255, 255, 0.25);
-            }
-            QPushButton:pressed {
-                background: rgba(255, 255, 255, 0.04);
-            }
+                padding: 10px 20px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 255, 255, 35);
+            }}
         """)
         self.cancel_btn.clicked.connect(self.reject)
         
         self.save_btn = QPushButton("Continue")
-        self.save_btn.setMinimumHeight(45)
+        self.save_btn.setMinimumHeight(36)
         self.save_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {CLAUDE_ORANGE};
-                border: 2px solid {CLAUDE_ORANGE};
-                border-radius: 12px;
+                background: rgba(0, 122, 255, 255);
+                border: 1px solid rgba(0, 122, 255, 255);
+                border-radius: 8px;
                 color: white;
-                font-size: 16px;
+                font-size: 14px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
                 font-weight: 600;
-                padding: 12px 30px;
-                min-width: 120px;
+                padding: 10px 20px;
             }}
             QPushButton:hover {{
-                background: {CLAUDE_ORANGE_LIGHT};
-                border: 2px solid {CLAUDE_ORANGE_LIGHT};
-            }}
-            QPushButton:pressed {{
-                background: {CLAUDE_ORANGE_DARK};
-                border: 2px solid {CLAUDE_ORANGE_DARK};
+                background: rgba(0, 122, 255, 230);
             }}
         """)
         self.save_btn.clicked.connect(self.save_api_key)
@@ -288,8 +1651,8 @@ class ModernAPIDialog(QDialog):
         self.api_key = key
         self.accept()
 
-class SettingsDialog(QDialog):
-    """Clean settings dialog with proper text visibility"""
+class FixedSettingsDialog(QDialog):
+    """Enhanced settings dialog"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -297,121 +1660,94 @@ class SettingsDialog(QDialog):
         
     def setup_ui(self):
         self.setWindowTitle("Settings")
-        self.setFixedSize(400, 350)
+        self.setFixedSize(340, 280)
         self.setModal(True)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        # Main layout
+        # Center the dialog
+        screen = QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            int(screen.height() * 0.15)
+        )
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Main container
-        main_widget = QWidget()
-        main_widget.setStyleSheet("""
-            QWidget {
-                background: rgba(45, 45, 45, 0.98);
-                border-radius: 16px;
-                border: 1px solid rgba(255, 107, 53, 0.2);
-            }
-        """)
-        layout.addWidget(main_widget)
+        self.main_widget = FastBlurWidget()
+        layout.addWidget(self.main_widget)
         
-        # Content layout
-        content_layout = QVBoxLayout(main_widget)
-        content_layout.setSpacing(20)
-        content_layout.setContentsMargins(30, 30, 30, 30)
+        content_layout = QVBoxLayout(self.main_widget)
+        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(20, 20, 20, 20)
         
-        # Header
+        header_layout = QHBoxLayout()
+        
         header = QLabel("⚙️ Settings")
-        header.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 24px;
-                font-weight: 600;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                background: transparent;
-                border: none;
-            }
+        header.setStyleSheet(f"""
+            color: rgba(255, 255, 255, 255);
+            font-size: 18px;
+            font-weight: 600;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
         """)
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        content_layout.addWidget(header)
+        header_layout.addWidget(header)
         
-        # Settings buttons
-        button_style = f"""
-            QPushButton {{
-                background: rgba(255, 255, 255, 0.06);
-                border: 2px solid rgba(255, 107, 53, 0.2);
-                border-radius: 10px;
-                color: white;
-                font-size: 15px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 500;
-                padding: 15px 20px;
-                text-align: left;
-                min-height: 20px;
-            }}
-            QPushButton:hover {{
-                background: rgba(255, 107, 53, 0.1);
-                border: 2px solid rgba(255, 107, 53, 0.4);
-                color: white;
-            }}
-            QPushButton:pressed {{
-                background: rgba(255, 107, 53, 0.05);
-            }}
-        """
+        header_layout.addStretch()
         
-        # Logout button
-        logout_btn = QPushButton("🔐 Change API Key")
-        logout_btn.setStyleSheet(button_style)
-        logout_btn.clicked.connect(self.logout)
-        content_layout.addWidget(logout_btn)
-        
-        # Website button
-        site_btn = QPushButton("🌐 Visit Website")
-        site_btn.setStyleSheet(button_style)
-        site_btn.clicked.connect(self.open_website)
-        content_layout.addWidget(site_btn)
-        
-        # UI Dimensions
-        dimensions_btn = QPushButton("📐 UI Dimensions")
-        dimensions_btn.setStyleSheet(button_style)
-        dimensions_btn.clicked.connect(self.ui_dimensions)
-        content_layout.addWidget(dimensions_btn)
-        
-        # About
-        about_btn = QPushButton("ℹ️ About")
-        about_btn.setStyleSheet(button_style)
-        about_btn.clicked.connect(self.about)
-        content_layout.addWidget(about_btn)
-        
-        # Spacer
-        content_layout.addStretch()
-        
-        # Close button
-        close_btn = QPushButton("Close")
-        close_btn.setMinimumHeight(40)
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(20, 20)
         close_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {CLAUDE_ORANGE};
-                border: 2px solid {CLAUDE_ORANGE};
+                background: rgba(255, 69, 58, 200);
+                border: none;
                 border-radius: 10px;
                 color: white;
-                font-size: 15px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-size: 14px;
                 font-weight: 600;
-                padding: 12px 20px;
             }}
             QPushButton:hover {{
-                background: {CLAUDE_ORANGE_LIGHT};
-                border: 2px solid {CLAUDE_ORANGE_LIGHT};
-            }}
-            QPushButton:pressed {{
-                background: {CLAUDE_ORANGE_DARK};
-                border: 2px solid {CLAUDE_ORANGE_DARK};
+                background: rgba(255, 69, 58, 255);
             }}
         """)
         close_btn.clicked.connect(self.accept)
-        content_layout.addWidget(close_btn)
+        header_layout.addWidget(close_btn)
+        
+        content_layout.addLayout(header_layout)
+        
+        button_style = f"""
+            QPushButton {{
+                background: rgba(40, 40, 40, 150);
+                border: 1px solid rgba(255, 255, 255, 60);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 13px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                font-weight: 500;
+                padding: 10px 12px;
+                text-align: left;
+                min-height: 16px;
+            }}
+            QPushButton:hover {{
+                background: rgba(50, 50, 50, 180);
+                border: 1px solid rgba(255, 255, 255, 80);
+            }}
+        """
+        
+        buttons_data = [
+            ("🔐 Change API Key", self.logout),
+            ("🌐 Visit Website", self.open_website),
+            ("📐 UI Info", self.ui_dimensions),
+            ("ℹ️ About", self.about)
+        ]
+        
+        for text, callback in buttons_data:
+            btn = QPushButton(text)
+            btn.setStyleSheet(button_style)
+            btn.clicked.connect(callback)
+            content_layout.addWidget(btn)
+        
+        content_layout.addStretch()
         
     def logout(self):
         self.accept()
@@ -419,16 +1755,18 @@ class SettingsDialog(QDialog):
         
     def open_website(self):
         import webbrowser
-        webbrowser.open("https://github.com/yourusername/wheel4")
+        webbrowser.open("https://thelearnchain.com")
         
     def ui_dimensions(self):
-        QMessageBox.information(self, "UI Dimensions", "Current screen width: 1920px\nUI adapts automatically to screen size")
+        QMessageBox.information(self, "UI Info", "Wheel4 with Fixed Custom Instructions\nVersion 2.0\nHotkey Fixed: Ctrl+Enter shows input first\nCustom Instructions: Improved UI")
         
     def about(self):
-        QMessageBox.information(self, "About", "Wheel4 AI Brain v2.0\nAn intelligent on-screen AI assistant")
+        QMessageBox.information(self, "About", "Wheel4 AI Brain v2.0\nBy LearnChain\nFixed Hotkey Handling & Custom Instructions")
 
 class AIBrainUI(QMainWindow):
-    """Modern AI Brain interface with clean design"""
+    """Enhanced Main AI Brain UI with fixed hotkey handling"""
+    
+    stealth_mode_changed = pyqtSignal(bool)
     
     def __init__(self, session_id):
         super().__init__()
@@ -436,11 +1774,21 @@ class AIBrainUI(QMainWindow):
         self.last_screenshot = None
         self.last_screenshot_time = 0
         self.current_response_data = None
+        self.is_stealth_mode = False
+        self.web_search_enabled = False
+        self.ai_worker = None
+        self.input_mode_active = False  # Track if input mode is active
+        
+        # Enhanced custom instructions state
+        self.current_custom_instructions = ""
+        self.instructions_locked = False
+        
         self.setup_ui()
         self.check_api_key()
+        self.load_session_custom_instructions()
         
     def setup_ui(self):
-        """Setup modern UI with Claude orange theme"""
+        """Enhanced UI setup"""
         # Window properties
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -448,624 +1796,879 @@ class AIBrainUI(QMainWindow):
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
         
-        # Get screen dimensions
         screen = QApplication.primaryScreen().geometry()
         self.screen_width = screen.width()
-        self.setGeometry(0, 0, self.screen_width, 72)
+        self.screen_height = screen.height()
         
-        # Main container
-        container = QWidget()
-        self.setCentralWidget(container)
+        self.ui_width = min(1000, self.screen_width - 200)
+        self.ui_left = (self.screen_width - self.ui_width) // 2
         
-        container.setStyleSheet("""
-            QWidget {
-                background: rgba(30, 30, 30, 0.9);
-                border-bottom: 2px solid rgba(255, 107, 53, 0.3);
-            }
-        """)
+        self.setGeometry(self.ui_left, 0, self.ui_width, 70)
         
-        # Main layout
-        self.main_layout = QVBoxLayout(container)
-        self.main_layout.setContentsMargins(24, 16, 24, 16)
-        self.main_layout.setSpacing(16)
+        self.container = FastBlurWidget()
+        self.setCentralWidget(self.container)
         
-        # Setup components
+        self.main_layout = QVBoxLayout(self.container)
+        self.main_layout.setContentsMargins(16, 10, 16, 10)
+        self.main_layout.setSpacing(10)
+        
         self.setup_top_bar()
         self.setup_question_input()
+        self.setup_question_display()
         self.setup_response_area()
         
+        self.resize_animation = QPropertyAnimation(self, b"geometry")
+        self.resize_animation.setDuration(200)
+        self.resize_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
     def setup_top_bar(self):
-        """Setup minimal top bar with logo and controls"""
+        """Enhanced top bar with logo support"""
         top_bar = QHBoxLayout()
         
-        # Logo and status
         logo_status_layout = QHBoxLayout()
-        logo_status_layout.setSpacing(12)
+        logo_status_layout.setSpacing(8)
         
-        # Logo placeholder
-        logo_label = QLabel("🧠")
-        logo_label.setStyleSheet(f"""
-            QLabel {{
-                color: {CLAUDE_ORANGE};
-                font-size: 24px;
-                background: transparent;
-                border: none;
-            }}
-        """)
-        logo_status_layout.addWidget(logo_label)
+        # Enhanced logo section with image support
+        self.logo_label = QLabel()
         
-        # Status indicator
+        # Try to load logo image, fallback to emoji
+        logo_path = "assets/logo.png"  # You can place your logo here
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            scaled_pixmap = pixmap.scaled(20, 20, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.logo_label.setPixmap(scaled_pixmap)
+        else:
+            # Fallback to enhanced icon
+            self.logo_label.setText("⚡")
+            self.logo_label.setStyleSheet("font-size: 18px; color: rgba(0, 122, 255, 255);")
+        
+        logo_status_layout.addWidget(self.logo_label)
+        
         self.status_label = QLabel("AI Brain")
         self.status_label.setStyleSheet(f"""
             QLabel {{
-                color: white;
-                font-size: 17px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 13px;
                 font-weight: 600;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                letter-spacing: -0.3px;
-                padding: 8px 16px;
-                background: rgba(255, 107, 53, 0.15);
-                border-radius: 18px;
-                border: 1px solid rgba(255, 107, 53, 0.3);
+                letter-spacing: -0.2px;
+                padding: 6px 10px;
+                background: transparent;
+                border: 1px solid rgba(255, 255, 255, 50);
+                border-radius: 10px;
             }}
         """)
         logo_status_layout.addWidget(self.status_label)
-        
         top_bar.addLayout(logo_status_layout)
         
-        top_bar.addStretch()
+        top_bar.addStretch(2)
+        self.compact_instruction_bar = CompactInstructionBar()
+        top_bar.addWidget(self.compact_instruction_bar)
+        top_bar.addStretch(1)
         
-        # Session info
-        self.session_info = QLabel(f"Session {self.session_id}")
-        self.session_info.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.6);
-                font-size: 13px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 400;
-                padding: 4px 8px;
-            }
-        """)
-        top_bar.addWidget(self.session_info)
+        self.session_dropdown = OptimizedDropdown()
+        self.session_dropdown.currentTextChanged.connect(self.switch_session)
+        self.update_session_dropdown()
+        top_bar.addWidget(self.session_dropdown)
         
-        # Control buttons
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(10)
-        
-        # Settings button
-        self.settings_btn = QPushButton("⚙️")
-        self.settings_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255, 255, 255, 0.06);
-                border: 1px solid rgba(255, 107, 53, 0.25);
-                border-radius: 8px;
-                color: {CLAUDE_ORANGE};
-                font-size: 16px;
-                font-weight: 500;
-                padding: 8px 10px;
-                min-width: 32px;
-                max-width: 32px;
-                min-height: 32px;
-                max-height: 32px;
-            }}
-            QPushButton:hover {{
-                background: rgba(255, 107, 53, 0.1);
-                border: 1px solid rgba(255, 107, 53, 0.4);
-            }}
-        """)
-        self.settings_btn.clicked.connect(self.show_settings)
-        controls_layout.addWidget(self.settings_btn)
-        
-        # Close button
-        self.close_btn = QPushButton("×")
-        self.close_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(255, 69, 58, 0.8);
-                border: none;
-                border-radius: 12px;
-                color: white;
-                font-size: 18px;
-                font-weight: 600;
-                min-width: 24px;
-                max-width: 24px;
-                min-height: 24px;
-                max-height: 24px;
-            }
-            QPushButton:hover {
-                background: rgba(255, 69, 58, 1.0);
-            }
-        """)
-        self.close_btn.clicked.connect(self.close_application)
-        controls_layout.addWidget(self.close_btn)
-        
-        top_bar.addLayout(controls_layout)
+        self.setup_control_buttons(top_bar)
         self.main_layout.addLayout(top_bar)
         
+    def setup_control_buttons(self, layout):
+        """Enhanced control buttons"""
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(4)
+        
+        button_style = f"""
+            QPushButton {{
+                background: rgba(40, 40, 40, 150);
+                border: 1px solid rgba(255, 255, 255, 60);
+                border-radius: 8px;
+                color: rgba(255, 255, 255, 255);
+                font-size: 11px;
+                font-weight: 500;
+                padding: 6px 8px;
+                min-width: 20px;
+                max-width: 20px;
+                min-height: 20px;
+                max-height: 20px;
+            }}
+            QPushButton:hover {{
+                background: rgba(50, 50, 50, 180);
+                border: 1px solid rgba(255, 255, 255, 80);
+            }}
+        """
+        
+        new_session_btn = QPushButton("➕")
+        new_session_btn.setStyleSheet(button_style)
+        new_session_btn.clicked.connect(self.create_new_session)
+        new_session_btn.setToolTip("New session")
+        
+        # Enhanced custom instructions button
+        self.custom_instructions_btn = CustomInstructionsButton(self.session_id)
+        self.custom_instructions_btn.instructions_changed.connect(self.update_custom_instructions)
+        
+        self.settings_btn = QPushButton("⚙️")
+        self.settings_btn.setStyleSheet(button_style)
+        self.settings_btn.clicked.connect(self.show_settings)
+        
+        self.close_btn = QPushButton("×")
+        self.close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 69, 58, 200);
+                border: none;
+                border-radius: 6px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
+                min-width: 16px;
+                max-width: 16px;
+                min-height: 16px;
+                max-height: 16px;
+            }}
+            QPushButton:hover {{
+                background: rgba(255, 69, 58, 255);
+            }}
+        """)
+        self.close_btn.clicked.connect(self.close_application)
+        
+        controls_layout.addWidget(new_session_btn)
+        controls_layout.addWidget(self.custom_instructions_btn)
+        controls_layout.addWidget(self.settings_btn)
+        controls_layout.addWidget(self.close_btn)
+        
+        layout.addLayout(controls_layout)
+        
     def setup_question_input(self):
-        """Setup question input area"""
+        """Enhanced question input"""
         self.input_container = QWidget()
+        self.input_container.setStyleSheet("background: transparent;")
         input_layout = QVBoxLayout(self.input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout.setSpacing(16)
+        input_layout.setSpacing(8)
         
-        # Input field
-        self.question_input = GlassTextEdit("Ask AI about your screen... (Shift+Enter for new line)")
+        self.question_input = EnhancedTextEdit("Type your question or press Enter to analyze screen...")
         self.question_input.enterPressed.connect(self.process_question)
-        input_layout.addWidget(self.question_input)
+        self.question_input.webSearchToggled.connect(self.toggle_web_search)
+        self.question_input.emptyEnterPressed.connect(self.handle_empty_enter)
         
-        # Quick actions
-        actions_layout = QHBoxLayout()
-        actions_layout.setSpacing(12)
+        input_layout.addWidget(self.question_input)
+        self.setup_quick_actions(input_layout)
+        
+        self.input_container.hide()
+        self.main_layout.addWidget(self.input_container)
+        
+    def setup_question_display(self):
+        """Setup question display"""
+        self.question_display = QuestionDisplay()
+        self.main_layout.addWidget(self.question_display)
+        
+    def setup_quick_actions(self, layout):
+        """Setup quick actions"""
+        self.quick_actions_container = QWidget()
+        self.quick_actions_container.setStyleSheet("background: transparent;")
+        actions_widget = QWidget()
+        actions_widget.setStyleSheet("background: transparent;")
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setSpacing(8)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
         
         quick_questions = [
-            ("Explain", "Explain what's on this screen"),
-            ("Issues", "Find any issues or problems"),
-            ("Next", "What should I do next?"),
-            ("Summary", "Summarize the key information")
+            ("Explain", "Explain what I'm looking at"),
+            ("How to", "How do I proceed with this?"),
+            ("Issues", "What issues should I be aware of?"),
+            ("Next", "What's my next step?")
         ]
         
         for label, question in quick_questions:
             btn = QPushButton(label)
             btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: rgba(255, 107, 53, 0.08);
-                    border: 1px solid rgba(255, 107, 53, 0.2);
+                    background: rgba(40, 40, 40, 150);
+                    border: 1px solid rgba(255, 255, 255, 50);
                     border-radius: 8px;
-                    color: {CLAUDE_ORANGE};
-                    font-size: 13px;
+                    color: rgba(255, 255, 255, 240);
+                    font-size: 11px;
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
                     font-weight: 500;
-                    padding: 8px 16px;
+                    padding: 6px 12px;
+                    min-height: 16px;
+                    min-width: 50px;
                 }}
                 QPushButton:hover {{
-                    background: rgba(255, 107, 53, 0.15);
-                    border: 1px solid rgba(255, 107, 53, 0.35);
-                }}
-                QPushButton:pressed {{
-                    background: rgba(255, 107, 53, 0.05);
+                    background: rgba(0, 122, 255, 100);
+                    border: 1px solid rgba(0, 122, 255, 140);
+                    color: rgba(255, 255, 255, 255);
                 }}
             """)
             btn.clicked.connect(lambda checked, q=question: self.quick_question(q))
             actions_layout.addWidget(btn)
         
+        actions_layout.insertStretch(0)
         actions_layout.addStretch()
-        input_layout.addLayout(actions_layout)
         
-        self.input_container.hide()
-        self.main_layout.addWidget(self.input_container)
+        quick_actions_layout = QVBoxLayout(self.quick_actions_container)
+        quick_actions_layout.setContentsMargins(0, 0, 0, 0)
+        quick_actions_layout.addWidget(actions_widget)
+        
+        self.quick_actions_container.hide()
+        layout.addWidget(self.quick_actions_container)
         
     def setup_response_area(self):
-        """Setup response display area"""
+        """Setup response area"""
         self.response_container = QWidget()
+        self.response_container.setStyleSheet("background: transparent;")
         response_layout = QVBoxLayout(self.response_container)
         response_layout.setContentsMargins(0, 0, 0, 0)
-        response_layout.setSpacing(16)
+        response_layout.setSpacing(10)
         
-        # Main response area
-        self.response_area = QTextEdit()
-        self.response_area.setReadOnly(True)
-        self.response_area.setMaximumHeight(300)
-        self.response_area.setStyleSheet(f"""
-            QTextEdit {{
-                background: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(255, 107, 53, 0.15);
-                border-radius: 16px;
-                color: white;
-                font-size: 15px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 400;
-                padding: 20px;
-                line-height: 1.6;
-                selection-background-color: rgba(255, 107, 53, 0.3);
-            }}
-            QScrollBar:vertical {{
-                background: rgba(255, 255, 255, 0.05);
-                width: 8px;
-                border-radius: 4px;
-                margin: 4px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: rgba(255, 107, 53, 0.4);
-                border-radius: 4px;
-                min-height: 20px;
-            }}
-            QScrollBar::handle:vertical:hover {{
-                background: rgba(255, 107, 53, 0.6);
-            }}
-        """)
+        self.loading_widget = LoadingWidget()
+        self.loading_widget.hide()
+        response_layout.addWidget(self.loading_widget)
+        
+        self.response_area = EnhancedResponseDisplay()
         response_layout.addWidget(self.response_area)
         
-        # Suggested questions area
-        self.suggestions_container = QWidget()
-        suggestions_layout = QVBoxLayout(self.suggestions_container)
-        suggestions_layout.setContentsMargins(0, 0, 0, 0)
-        suggestions_layout.setSpacing(10)
-        
-        # Suggestions title
-        suggestions_title = QLabel("Suggested Questions")
-        suggestions_title.setStyleSheet(f"""
-            QLabel {{
-                color: {CLAUDE_ORANGE};
-                font-size: 14px;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                font-weight: 600;
-                letter-spacing: -0.1px;
-                padding: 0 4px;
-            }}
-        """)
-        suggestions_layout.addWidget(suggestions_title)
-        
-        # Suggestions buttons container
-        self.suggestions_scroll = QScrollArea()
-        self.suggestions_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.suggestions_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.suggestions_scroll.setWidgetResizable(True)
-        self.suggestions_scroll.setMaximumHeight(60)
-        self.suggestions_scroll.setStyleSheet("""
-            QScrollArea {
-                background: transparent;
-                border: none;
-            }
-        """)
-        
-        self.suggestions_widget = QWidget()
-        self.suggestions_layout = QVBoxLayout(self.suggestions_widget)
-        self.suggestions_layout.setContentsMargins(0, 0, 0, 0)
-        self.suggestions_layout.setSpacing(8)
-        
-        self.suggestions_scroll.setWidget(self.suggestions_widget)
-        suggestions_layout.addWidget(self.suggestions_scroll)
-        
-        self.suggestions_container.hide()
-        response_layout.addWidget(self.suggestions_container)
+        self.setup_suggestions_area(response_layout)
         
         self.response_container.hide()
         self.main_layout.addWidget(self.response_container)
         
-    def parse_json_response(self, response_text):
-        """Parse JSON response with robust error handling"""
-        # Use the improved extraction function
-        response_data = extract_json_from_response(response_text)
+    def setup_suggestions_area(self, layout):
+        """Setup suggestions"""
+        self.suggestions_container = QWidget()
+        self.suggestions_container.setStyleSheet("background: transparent;")
+        suggestions_layout = QVBoxLayout(self.suggestions_container)
+        suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        suggestions_layout.setSpacing(6)
         
-        if response_data and isinstance(response_data, dict):
-            # Ensure all required fields exist
-            required_fields = ["response", "code_blocks", "links", "suggested_questions"]
-            for field in required_fields:
-                if field not in response_data:
-                    if field == "response":
-                        response_data[field] = response_text
-                    else:
-                        response_data[field] = []
+        suggestions_title = QLabel("Suggested Questions")
+        suggestions_title.setStyleSheet(f"""
+            color: rgba(255, 255, 255, 220);
+            font-size: 11px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-weight: 600;
+            letter-spacing: -0.1px;
+            padding: 0 2px;
+        """)
+        suggestions_layout.addWidget(suggestions_title)
+        
+        self.suggestions_widget = QWidget()
+        self.suggestions_widget.setStyleSheet("background: transparent;")
+        self.suggestions_layout = QGridLayout(self.suggestions_widget)
+        self.suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        self.suggestions_layout.setSpacing(6)
+        
+        suggestions_layout.addWidget(self.suggestions_widget)
+        self.suggestions_container.hide()
+        layout.addWidget(self.suggestions_container)
+    
+    def load_session_custom_instructions(self):
+        """Enhanced custom instructions loading with lock check"""
+        if self.session_id:
+            instructions = get_session_custom_instructions(self.session_id)
+            self.current_custom_instructions = instructions
             
-            print("✅ JSON response parsed successfully")
-            return response_data
-        
-        # Fallback: create structured response
-        print("⚠️  Using fallback response format")
-        return {
-            "response": response_text,
-            "code_blocks": [],
-            "links": [],
-            "suggested_questions": [
-                "What should I do next?",
-                "Can you explain more?",
-                "Are there any issues?",
-                "How can I improve this?"
-            ]
-        }
-        
-    def format_response(self, response_data):
-        """Format structured response with Claude orange styling"""
-        html_parts = []
-        
-        # Main response text
-        response_text = response_data.get('response', '')
-        if response_text:
-            # Convert markdown formatting with Claude orange
-            response_text = re.sub(r'\*\*(.*?)\*\*', f'<strong style="color: {CLAUDE_ORANGE};">\\1</strong>', response_text)
-            response_text = re.sub(r'\*(.*?)\*', r'<em style="color: rgba(255, 255, 255, 0.95);">\1</em>', response_text)
+            # Check if instructions should be locked
+            from database import get_session_history
+            history = get_session_history(self.session_id, limit=1)
+            self.instructions_locked = len(history) > 0 and bool(instructions)
             
-            # Handle code spans
-            response_text = re.sub(r'`(.*?)`', f'<code style="background: rgba(255, 107, 53, 0.1); color: {CLAUDE_ORANGE}; padding: 3px 6px; border-radius: 4px; font-family: SF Mono, Monaco, monospace; font-size: 14px;">\\1</code>', response_text)
+            if hasattr(self, 'custom_instructions_btn'):
+                self.custom_instructions_btn.update_session(self.session_id)
             
-            # Handle bullet points
-            response_text = re.sub(r'^- (.*?)$', f'<div style="margin: 10px 0; padding-left: 20px; position: relative;"><span style="position: absolute; left: 0; color: {CLAUDE_ORANGE};">•</span>\\1</div>', response_text, flags=re.MULTILINE)
-            
-            # Handle numbered lists
-            response_text = re.sub(r'^(\d+)\. (.*?)$', f'<div style="margin: 10px 0; padding-left: 26px; position: relative;"><span style="position: absolute; left: 0; color: {CLAUDE_ORANGE}; font-weight: 600;">\\1.</span>\\2</div>', response_text, flags=re.MULTILINE)
-            
-            # Handle paragraphs
-            response_text = response_text.replace('\n\n', '</p><p style="margin: 18px 0 0 0;">')
-            response_text = response_text.replace('\n', '<br>')
-            
-            html_parts.append(f'<p style="margin: 0; color: rgba(255, 255, 255, 0.95);">{response_text}</p>')
+            # Enhanced status updates
+            if instructions:
+                if self.instructions_locked:
+                    self.status_label.setText("🔒 Locked AI")
+                else:
+                    self.status_label.setText("🎯 Custom AI")
+            else:
+                self.status_label.setText("AI Brain")
+    
+    def update_custom_instructions(self, instructions):
+        """Enhanced custom instructions update"""
+        self.current_custom_instructions = instructions
+        print(f"🎯 Updated custom instructions ({len(instructions)} chars)")
         
-        # Code blocks
-        code_blocks = response_data.get('code_blocks', [])
-        if code_blocks:
-            html_parts.append('<div style="margin-top: 24px;">')
-            for code_block in code_blocks:
-                html_parts.append(f'''
-                <div style="margin: 16px 0; background: rgba(0, 0, 0, 0.3); border-radius: 12px; border: 1px solid rgba(255, 107, 53, 0.2); overflow: hidden;">
-                    <div style="padding: 10px 16px; border-bottom: 1px solid rgba(255, 107, 53, 0.2); background: rgba(255, 107, 53, 0.05);">
-                        <span style="color: {CLAUDE_ORANGE}; font-size: 13px; font-weight: 600; font-family: SF Mono, Monaco, monospace;">
-                            {code_block.get('language', 'code')}
-                        </span>
-                    </div>
-                    <div style="padding: 16px; font-family: SF Mono, Monaco, monospace; font-size: 14px; color: rgba(255, 255, 255, 0.95); line-height: 1.5; white-space: pre-wrap;">
-                        {code_block.get('code', '')}
-                    </div>
-                </div>
-                ''')
-            html_parts.append('</div>')
+        # Update lock status
+        if instructions and not self.instructions_locked:
+            from database import get_session_history
+            history = get_session_history(self.session_id, limit=1)
+            self.instructions_locked = len(history) > 0
         
-        # Links
-        links = response_data.get('links', [])
-        if links:
-            html_parts.append('<div style="margin-top: 24px;">')
-            for link in links:
-                html_parts.append(f'''
-                <div style="margin: 12px 0; padding: 16px; background: rgba(255, 107, 53, 0.05); border-radius: 12px; border-left: 4px solid {CLAUDE_ORANGE};">
-                    <a href="{link['url']}" style="color: {CLAUDE_ORANGE}; text-decoration: none; font-weight: 600; font-size: 15px;">{link['title']}</a>
-                    <div style="color: rgba(255, 255, 255, 0.7); font-size: 14px; margin-top: 6px; line-height: 1.4;">{link['description']}</div>
-                </div>
-                ''')
-            html_parts.append('</div>')
-        
-        return ''.join(html_parts)
-        
-    def check_api_key(self):
-        """Check API key"""
-        api_key = get_api_key()
-        if not api_key:
-            QTimer.singleShot(300, self.show_api_key_setup)
+        # Enhanced status updates
+        if instructions:
+            if self.instructions_locked:
+                self.status_label.setText("🔒 Locked AI")
+            else:
+                self.status_label.setText("🎯 Custom AI")
         else:
             self.status_label.setText("AI Brain")
-            
-    def show_api_key_setup(self):
-        """Show API key setup dialog"""
-        dialog = ModernAPIDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            save_api_key(dialog.api_key)
-            self.status_label.setText("AI Brain")
-            print("✅ API key saved")
-        else:
-            self.close_application()
-            
-    def show_settings(self):
-        """Show settings dialog"""
-        dialog = SettingsDialog(self)
-        dialog.exec()
+    
+    def toggle_web_search(self, enabled):
+        """Toggle web search"""
+        self.web_search_enabled = enabled
+        print(f"🌐 Web search: {'Enabled' if enabled else 'Disabled'}")
         
-    def reset_data(self):
-        """Reset all data"""
-        save_api_key("")
-        self.show_api_key_setup()
-            
-    def toggle_visibility(self):
-        """Toggle window visibility"""
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show()
-            self.raise_()
-            self.activateWindow()
-            
+    def handle_empty_enter(self):
+        """Handle empty ctrl+enter - analyze screen automatically"""
+        print("⚡ Empty enter - analyzing screen automatically")
+        # Treat empty enter as screen analysis request
+        self.process_question_internal("")
+        
+    def process_question(self):
+        """Process question from input field"""
+        question = self.question_input.toPlainText().strip()
+        print(f"🤔 Processing question: '{question}'")
+        self.process_question_internal(question)
+        
+    def process_question_internal(self, question):
+        """Internal method to process questions (handles both typed and empty)"""
+        print(f"🤔 Starting to process: '{question}' (Web search: {self.web_search_enabled})")
+        if self.current_custom_instructions:
+            print(f"🎯 Using custom instructions ({len(self.current_custom_instructions)} chars)")
+            if self.instructions_locked:
+                print(f"🔒 Instructions are locked")
+        
+        # Lock instructions after first use
+        if self.current_custom_instructions and not self.instructions_locked:
+            self.instructions_locked = True
+            print(f"🔒 Locking custom instructions after first use")
+        
+        # Check if custom instructions are active
+        has_custom_instructions = bool(self.current_custom_instructions)
+        
+        # For display purposes, show what we're doing
+        display_question = question if question else "Analyzing screen..."
+        self.question_display.set_question(display_question, self.web_search_enabled, has_custom_instructions)
+        
+        # Exit input mode
+        self.input_mode_active = False
+        self.question_input.set_input_mode(False)
+        
+        self.question_input.clear()
+        self.input_container.hide()
+        
+        self.response_area.clear()
+        self.response_area.hide()
+        self.suggestions_container.hide()
+        
+        self.quick_actions_container.show()
+        self.status_label.setText("Processing...")
+        
+        self.loading_widget.set_web_search_mode(self.web_search_enabled)
+        self.loading_widget.start_animation()
+        self.loading_widget.show()
+        
+        self.fast_resize(280)
+        self.response_container.show()
+        
+        print("🚀 Starting enhanced AI worker thread...")
+        self.start_ai_processing(question)
+        
+    def fast_resize(self, new_height):
+        """Fast window resize"""
+        current_rect = self.geometry()
+        new_rect = QRect(current_rect.x(), current_rect.y(), current_rect.width(), new_height)
+        
+        self.resize_animation.setStartValue(current_rect)
+        self.resize_animation.setEndValue(new_rect)
+        self.resize_animation.start()
+
     def show_question_input(self):
-        """Show question input"""
+        """Show question input with instant cursor focus - FIXED"""
+        print("🎯 Showing question input with instant focus")
+        
         if not self.isVisible():
             self.show()
-            
+        
         self.raise_()
         self.activateWindow()
         
-        # Expand window
-        self.setGeometry(0, 0, self.screen_width, 220)
+        if hasattr(self, 'question_display'):
+            self.question_display.clear_question()
+        if hasattr(self, 'response_container'):
+            self.response_container.hide()
+        if hasattr(self, 'suggestions_container'):
+            self.suggestions_container.hide()
         
         self.input_container.show()
-        
-        self.question_input.setFocus()
+        self.fast_resize(170)
         self.question_input.clear()
         
-        self.status_label.setText("Listening...")
+        # Enable input mode and focus (includes hotkey protection)
+        self.question_input.ensure_focus_immediately()
         
-    def quick_question(self, question):
-        """Process quick question"""
-        self.question_input.setPlainText(question)
-        self.process_question()
+        # Update status to show options
+        self.status_label.setText("Type question or press Enter to analyze screen...")
         
-    def process_question(self):
-        """Process user question"""
-        question = self.question_input.toPlainText().strip()
-        if not question:
-            return
+    def start_ai_processing(self, question):
+        """Enhanced AI processing with better error handling"""
+        try:
+            if self.ai_worker and self.ai_worker.isRunning():
+                print("⚠️ Previous AI worker still running, waiting...")
+                self.ai_worker.quit()
+                self.ai_worker.wait(3000)  # Increased wait time
             
-        print(f"🤔 Processing: {question}")
+            self.ai_worker = AIWorkerThread(
+                question, 
+                self.session_id, 
+                self.web_search_enabled,
+                custom_instructions=self.current_custom_instructions
+            )
+            
+            self.ai_worker.response_ready.connect(self.handle_ai_response)
+            self.ai_worker.error_occurred.connect(self.handle_ai_error)
+            self.ai_worker.screenshot_captured.connect(self.handle_screenshot_captured)
+            self.ai_worker.status_update.connect(self.handle_status_update)
+            
+            self.ai_worker.start()
+            print("✅ Enhanced AI worker thread started")
+            
+            # Enhanced timeout with longer duration
+            QTimer.singleShot(45000, self.handle_ai_timeout)  # Increased from 30s to 45s
+            
+        except Exception as e:
+            error_msg = f"Failed to start AI processing: {str(e)}"
+            print(f"❌ {error_msg}")
+            self.handle_ai_error(error_msg)
+    
+    def handle_screenshot_captured(self):
+        """Handle screenshot capture"""
+        print("📸 Screenshot captured successfully")
+        self.status_label.setText("Analyzing...")
         
-        # Clear old response and update UI
-        self.response_area.clear()
-        self.response_container.hide()
-        self.suggestions_container.hide()
-        self.input_container.hide()
-        self.status_label.setText("Thinking...")
+    def handle_status_update(self, status):
+        """Handle status updates"""
+        print(f"📊 Status update: {status}")
+        self.status_label.setText(status)
+        self.loading_widget.set_status(status)
         
-        # Expand for response
-        self.setGeometry(0, 0, self.screen_width, 400)
-        self.response_container.show()
+    def handle_ai_timeout(self):
+        """Enhanced timeout handling"""
+        if self.ai_worker and self.ai_worker.isRunning():
+            print("⏰ AI processing timed out after 45 seconds")
+            self.ai_worker.quit()
+            self.ai_worker.wait(2000)
+            self.handle_ai_error("AI processing timed out. This may be due to high server load. Please try again.")
+    
+    def handle_ai_response(self, data):
+        """Enhanced AI response handling"""
+        try:
+            response, question = data
+            print(f"✅ Received AI response in main thread")
+            
+            self.loading_widget.stop_animation()
+            self.loading_widget.hide()
+            
+            response_data = self.parse_json_response(response)
+            print(f"📊 Parsed response data: {len(str(response_data))} chars")
+            
+            self.show_final_response(response_data, question)
+            
+        except Exception as e:
+            error_msg = f"Error handling AI response: {str(e)}"
+            print(f"❌ {error_msg}")
+            self.handle_ai_error(error_msg)
+    
+    def handle_ai_error(self, error_message):
+        """Enhanced error handling"""
+        print(f"❌ AI Error: {error_message}")
         
-        # Show loading placeholder
-        self.response_area.setHtml(f"""
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; line-height: 1.6; color: white;">
-            <div style="margin-bottom: 20px; padding: 18px; background: rgba(255, 107, 53, 0.1); border-radius: 12px; border-left: 4px solid {CLAUDE_ORANGE};">
-                <div style="color: {CLAUDE_ORANGE}; font-weight: 600; font-size: 14px; margin-bottom: 10px; letter-spacing: -0.1px;">YOUR QUESTION</div>
-                <div style="color: rgba(255, 255, 255, 0.95); font-size: 15px; line-height: 1.5;">{question}</div>
-            </div>
-            <div style="padding: 18px; background: rgba(255, 255, 255, 0.03); border-radius: 12px; border-left: 4px solid rgba(255, 255, 255, 0.2);">
-                <div style="color: {CLAUDE_ORANGE}; font-weight: 600; font-size: 14px; margin-bottom: 10px; letter-spacing: -0.1px;">AI RESPONSE</div>
-                <div style="color: rgba(255, 255, 255, 0.7); font-size: 15px;">
-                    <span style="opacity: 0.6;">●</span> Analyzing your screen...
-                </div>
-            </div>
-        </div>
-        """)
+        self.loading_widget.stop_animation()
+        self.loading_widget.hide()
         
-        # Process in background
-        def process_in_background():
-            try:
-                start_time = time.time()
+        self.show_error(error_message)
+        
+        if self.ai_worker:
+            self.ai_worker.quit()
+            self.ai_worker = None
+        
+    def parse_json_response(self, response_text):
+        """Enhanced JSON response parsing"""
+        try:
+            response_data = extract_json_from_response(response_text)
+            if response_data and isinstance(response_data, dict):
+                required_fields = ["response", "code_blocks", "links", "suggested_questions"]
+                for field in required_fields:
+                    if field not in response_data:
+                        if field == "response":
+                            response_data[field] = str(response_text)[:1000]
+                        else:
+                            response_data[field] = []
+                return response_data
+        except Exception as e:
+            print(f"❌ JSON parsing error: {e}")
+        
+        # Enhanced fallback
+        return {
+            "response": str(response_text)[:1000] if response_text else "Response received successfully.",
+            "code_blocks": [],
+            "links": [],
+            "suggested_questions": [
+                "How do I proceed with this?",
+                "Can you explain this in more detail?", 
+                "What are the key things to understand?",
+                "How can I apply this knowledge?",
+                "What should I be careful about?",
+                "Are there better approaches?"
+            ]
+        }
+        
+    def format_response_with_code_blocks(self, response_data):
+        """Enhanced response formatting"""
+        try:
+            html_parts = []
+            
+            # Main response
+            response_text = response_data.get('response', 'Response received successfully.')
+            if response_text:
+                # Safe HTML processing
+                response_text = html.escape(response_text)
+                response_text = re.sub(r'\*\*(.*?)\*\*', r'<strong style="color: rgba(0, 122, 255, 255); font-weight: 600;">\1</strong>', response_text)
+                response_text = re.sub(r'\*(.*?)\*', r'<em style="color: rgba(255, 255, 255, 255); font-style: italic;">\1</em>', response_text)
+                response_text = re.sub(r'`(.*?)`', r'<code style="background: rgba(0, 122, 255, 15); color: rgba(0, 122, 255, 255); padding: 2px 6px; border-radius: 4px; font-family: SF Mono, Monaco, Consolas, monospace; font-size: 13px;">\1</code>', response_text)
                 
-                # Optimized screenshot capture
-                current_time = time.time()
-                if (self.last_screenshot and 
-                    current_time - self.last_screenshot_time < 2.0):
-                    screenshot = self.last_screenshot
-                    print("📸 Using cached screenshot")
+                response_text = response_text.replace('\n\n', '</p><p style="margin: 12px 0 0 0;">')
+                response_text = response_text.replace('\n', '<br>')
+                
+                html_parts.append(f'<p style="margin: 0; color: rgba(255, 255, 255, 255); line-height: 1.6;">{response_text}</p>')
+            
+            # Code blocks
+            code_blocks = response_data.get('code_blocks', [])
+            for i, code_block in enumerate(code_blocks):
+                if isinstance(code_block, dict):
+                    language = html.escape(str(code_block.get('language', 'text')))
+                    code = html.escape(str(code_block.get('code', '')))
+                    description = html.escape(str(code_block.get('description', '')))
+                    
+                    code_html = f"""
+                    <div style="margin: 16px 0; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255, 255, 255, 25);">
+                        <div style="background: rgba(0, 122, 255, 20); padding: 8px 12px; border-bottom: 1px solid rgba(255, 255, 255, 15);">
+                            <span style="color: rgba(0, 122, 255, 255); font-size: 11px; font-weight: 600; letter-spacing: 0.5px;">{language.upper()}</span>
+                        </div>
+                        <pre style="margin: 0; padding: 12px; color: rgba(255, 255, 255, 255); font-family: SF Mono, Monaco, Consolas, monospace; font-size: 13px; line-height: 1.4; white-space: pre-wrap; background: rgba(15, 15, 15, 160);"><code>{code}</code></pre>
+                        {f'<div style="padding: 8px 12px; border-top: 1px solid rgba(255, 255, 255, 15); color: rgba(255, 255, 255, 200); font-size: 12px; background: rgba(10, 10, 10, 120);">{description}</div>' if description else ''}
+                    </div>
+                    """
+                    html_parts.append(code_html)
+            
+            # Links
+            links = response_data.get('links', [])
+            if links:
+                html_parts.append('<div style="margin: 16px 0;">')
+                html_parts.append('<div style="color: rgba(0, 122, 255, 255); font-size: 11px; font-weight: 600; margin-bottom: 8px; letter-spacing: 0.5px;">🔗 USEFUL LINKS</div>')
+                
+                for link in links:
+                    if isinstance(link, dict) and "url" in link:
+                        url = html.escape(str(link.get('url', '')))
+                        title = html.escape(str(link.get('title', 'Link')))
+                        description = html.escape(str(link.get('description', '')))
+                        
+                        link_html = f"""
+                        <div style="border-radius: 6px; padding: 10px; margin: 6px 0; border-left: 2px solid rgba(0, 122, 255, 100); background: rgba(0, 122, 255, 20);">
+                            <a href="{url}" style="color: rgba(0, 122, 255, 255); text-decoration: underline; font-weight: 500; font-size: 13px;">{title}</a>
+                            {f'<div style="color: rgba(255, 255, 255, 200); font-size: 11px; margin-top: 4px;">{description}</div>' if description else ''}
+                        </div>
+                        """
+                        html_parts.append(link_html)
+                
+                html_parts.append('</div>')
+            
+            return ''.join(html_parts) if html_parts else '<p style="margin: 0; color: rgba(255, 255, 255, 255);">Response received successfully.</p>'
+            
+        except Exception as e:
+            print(f"❌ HTML formatting error: {e}")
+            # Enhanced fallback
+            safe_text = html.escape(str(response_data.get('response', 'Response received successfully.')))
+            return f'<p style="margin: 0; color: rgba(255, 255, 255, 255);">{safe_text}</p>'
+        
+    def show_final_response(self, response_data, question):
+        """Enhanced final response display"""
+        try:
+            self.loading_widget.stop_animation()
+            self.loading_widget.hide()
+            
+            self.response_area.show()
+            
+            formatted_response = self.format_response_with_code_blocks(response_data)
+            
+            # Enhanced header based on custom instructions
+            if self.current_custom_instructions:
+                if self.instructions_locked:
+                    header_text = "🔒 LOCKED AI RESPONSE"
                 else:
-                    print("📸 Capturing fresh screenshot...")
-                    screenshot = capture_full_screen()
-                    self.last_screenshot = screenshot
-                    self.last_screenshot_time = current_time
-                
-                # Get context
-                history = get_session_history(self.session_id, limit=3)
-                context = ""
-                if history:
-                    context_parts = []
-                    for q, r, t in history:
-                        context_parts.append(f"Q: {q[:100]}")
-                        context_parts.append(f"A: {r[:150]}")
-                    context = "\n".join(context_parts)
-                
-                print("🤖 Getting AI response...")
-                
-                # Get response
-                response = get_ai_response(question, screenshot, context)
-                
-                # Parse response
-                if isinstance(response, dict) and "error" in response:
-                    QTimer.singleShot(0, lambda: self.show_error(response["error"]))
-                    return
-                
-                response_data = self.parse_json_response(response)
-                
-                elapsed = time.time() - start_time
-                print(f"✅ Response received in {elapsed:.2f}s")
-                
-                # Store for UI update
-                self.current_response_data = response_data
-                self.current_question = question
-                
-                # Update UI
-                QTimer.singleShot(0, self.show_final_response)
-                
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                QTimer.singleShot(0, lambda: self.show_error(str(e)))
-        
-        threading.Thread(target=process_in_background, daemon=True).start()
-        
-    def show_final_response(self):
-        """Show the final response"""
-        response_data = self.current_response_data
-        question = self.current_question
-        
-        # Format the response
-        formatted_response = self.format_response(response_data)
-        
-        # Create the full HTML
-        full_html = f"""
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; line-height: 1.6; color: white;">
-            <div style="margin-bottom: 24px; padding: 18px; background: rgba(255, 107, 53, 0.1); border-radius: 12px; border-left: 4px solid {CLAUDE_ORANGE};">
-                <div style="color: {CLAUDE_ORANGE}; font-weight: 600; font-size: 14px; margin-bottom: 10px; letter-spacing: -0.1px;">YOUR QUESTION</div>
-                <div style="color: rgba(255, 255, 255, 0.95); font-size: 15px; line-height: 1.5;">{question}</div>
-            </div>
+                    header_text = "🎯 CUSTOM AI RESPONSE"
+            else:
+                header_text = "✨ AI RESPONSE"
             
-            <div style="padding: 18px; background: rgba(255, 255, 255, 0.03); border-radius: 12px; border-left: 4px solid rgba(255, 255, 255, 0.2);">
-                <div style="color: {CLAUDE_ORANGE}; font-weight: 600; font-size: 14px; margin-bottom: 12px; letter-spacing: -0.1px;">AI RESPONSE</div>
-                <div style="color: rgba(255, 255, 255, 0.95); font-size: 15px; line-height: 1.7;">
-                    {formatted_response}
+            full_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; line-height: 1.6;">
+                <div style="padding: 20px; background: rgba(25, 25, 25, 120); border-radius: 12px; border-left: 3px solid rgba(0, 122, 255, 120);">
+                    <div style="color: rgba(0, 122, 255, 255); font-weight: 700; font-size: 11px; margin-bottom: 12px; letter-spacing: 0.8px; text-align: left;">{header_text}</div>
+                    <div style="color: rgba(255, 255, 255, 255); font-size: 14px;">
+                        {formatted_response}
+                    </div>
                 </div>
             </div>
-        </div>
-        """
-        
-        # Set the response
-        self.response_area.setHtml(full_html)
-        
-        self.status_label.setText("Complete")
-        
-        # Show suggested questions
-        suggested_questions = response_data.get('suggested_questions', [])
-        if suggested_questions:
-            self.show_suggested_questions(suggested_questions)
-        
-        # Save to database
-        save_interaction(self.session_id, question, response_data.get('response', ''))
+            """
+            
+            self.response_area.typewrite_text(full_html)
+            
+            # Enhanced status based on custom instructions
+            if self.current_custom_instructions:
+                if self.instructions_locked:
+                    self.status_label.setText("🔒 Complete")
+                else:
+                    self.status_label.setText("🎯 Complete")
+            else:
+                self.status_label.setText("Complete")
+            
+            suggested_questions = response_data.get('suggested_questions', [])
+            if suggested_questions:
+                self.show_suggested_questions(suggested_questions)
+            
+            # Save interaction
+            try:
+                save_interaction(self.session_id, question, response_data.get('response', ''))
+            except Exception as e:
+                print(f"⚠️ Error saving interaction: {e}")
+                
+        except Exception as e:
+            print(f"❌ Error showing final response: {e}")
+            self.show_error("Response received but display failed. Please try again.")
         
     def show_suggested_questions(self, questions):
-        """Show suggested questions with proper error handling"""
-        # Clear existing suggestions safely
-        for i in reversed(range(self.suggestions_layout.count())):
-            item = self.suggestions_layout.itemAt(i)
-            if item and item.widget():
-                item.widget().setParent(None)
-        
-        # Add new suggestions
-        for question in questions[:3]:  # Max 3 suggestions
-            btn = QPushButton(question)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: rgba(255, 107, 53, 0.08);
-                    border: 1px solid rgba(255, 107, 53, 0.2);
-                    border-radius: 8px;
-                    color: {CLAUDE_ORANGE};
-                    font-size: 13px;
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                    font-weight: 500;
-                    padding: 10px 16px;
-                    text-align: left;
-                    min-height: 20px;
-                }}
-                QPushButton:hover {{
-                    background: rgba(255, 107, 53, 0.15);
-                    border: 1px solid rgba(255, 107, 53, 0.35);
-                }}
-                QPushButton:pressed {{
-                    background: rgba(255, 107, 53, 0.05);
-                }}
-            """)
-            btn.clicked.connect(lambda checked, q=question: self.ask_suggested_question(q))
-            self.suggestions_layout.addWidget(btn)
-        
-        self.suggestions_container.show()
+        """Enhanced suggested questions display"""
+        try:
+            # Clear existing
+            for i in reversed(range(self.suggestions_layout.count())):
+                item = self.suggestions_layout.itemAt(i)
+                if item and item.widget():
+                    item.widget().setParent(None)
+                    
+            for i, question in enumerate(questions[:6]):
+                btn = QPushButton(str(question)[:80] + "..." if len(str(question)) > 80 else str(question))
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: rgba(40, 40, 40, 120);
+                        border: 1px solid rgba(255, 255, 255, 40);
+                        border-radius: 8px;
+                        color: rgba(255, 255, 255, 220);
+                        font-size: 11px;
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+                        font-weight: 500;
+                        padding: 8px 12px;
+                        text-align: left;
+                        min-height: 16px;
+                    }}
+                    QPushButton:hover {{
+                        background: rgba(0, 122, 255, 100);
+                        border: 1px solid rgba(0, 122, 255, 140);
+                        color: rgba(255, 255, 255, 255);
+                    }}
+                """)
+                btn.clicked.connect(lambda checked, q=str(question): self.ask_suggested_question(q))
+                self.suggestions_layout.addWidget(btn, i // 2, i % 2)
+                
+            self.suggestions_container.show()
+            
+        except Exception as e:
+            print(f"⚠️ Error showing suggested questions: {e}")
         
     def ask_suggested_question(self, question):
-        """Ask a suggested question"""
-        self.question_input.setPlainText(question)
-        self.process_question()
+        """Ask suggested question"""
+        try:
+            self.question_input.setPlainText(question)
+            self.process_question()
+        except Exception as e:
+            print(f"⚠️ Error asking suggested question: {e}")
         
     def show_error(self, error):
-        """Show error message"""
-        self.status_label.setText("Error")
+        """Enhanced error display"""
+        try:
+            self.loading_widget.stop_animation()
+            self.loading_widget.hide()
+            
+            self.response_area.show()
+            
+            self.status_label.setText("Error")
+            self.fast_resize(180)
+            
+            safe_error = html.escape(str(error)[:300])  # Increased error length
+            error_html = f"""
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;">
+                <div style="padding: 20px; background: rgba(60, 20, 20, 120); border-radius: 12px; border-left: 3px solid rgba(255, 69, 58, 180);">
+                    <div style="color: rgba(255, 69, 58, 255); font-weight: 700; font-size: 11px; margin-bottom: 8px; letter-spacing: 0.8px;">⚠️ ERROR</div>
+                    <div style="color: rgba(255, 255, 255, 255); font-size: 14px; line-height: 1.5;">{safe_error}</div>
+                    <div style="color: rgba(255, 255, 255, 180); font-size: 12px; margin-top: 8px;">Try rephrasing your question or check your internet connection.</div>
+                </div>
+            </div>
+            """
+            self.response_area.setHtml(error_html)
+            self.response_container.show()
+            QTimer.singleShot(5000, lambda: self.status_label.setText("AI Brain"))
+            
+        except Exception as e:
+            print(f"❌ Error showing error: {e}")
         
-        self.setGeometry(0, 0, self.screen_width, 180)
-        error_html = f"""
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 20px; background: rgba(255, 100, 100, 0.1); border-radius: 12px; border-left: 4px solid rgba(255, 100, 100, 0.6);">
-            <div style="color: rgba(255, 100, 100, 0.9); font-weight: 600; font-size: 14px; margin-bottom: 10px;">ERROR</div>
-            <div style="color: rgba(255, 255, 255, 0.95); font-size: 15px; line-height: 1.5;">{error}</div>
-        </div>
-        """
-        self.response_area.setHtml(error_html)
-        self.response_container.show()
+    def update_session_dropdown(self):
+        """Enhanced session dropdown with custom instructions indicators"""
+        try:
+            self.session_dropdown.clear()
+            sessions = get_all_sessions()
+            for session_id, name, created_at, total_tokens, is_active, custom_instructions in sessions:
+                display_name = f"Session {session_id}"
+                if session_id == self.session_id:
+                    display_name += " (Current)"
+                if custom_instructions:
+                    # Check if locked
+                    from database import get_session_history
+                    history = get_session_history(session_id, limit=1)
+                    is_locked = len(history) > 0
+                    if is_locked:
+                        display_name += " 🔒"
+                    else:
+                        display_name += " 🎯"
+                self.session_dropdown.addItem(display_name, session_id)
+            for i in range(self.session_dropdown.count()):
+                if self.session_dropdown.itemData(i) == self.session_id:
+                    self.session_dropdown.setCurrentIndex(i)
+                    break
+        except Exception as e:
+            print(f"⚠️ Error updating session dropdown: {e}")
+                
+    def switch_session(self, text):
+        """Enhanced session switching"""
+        try:
+            if not text or "(Current)" in text:
+                return
+            session_id = self.session_dropdown.currentData()
+            if session_id and session_id != self.session_id:
+                self.session_id = session_id
+                switch_to_session(session_id)
+                self.load_session_custom_instructions()
+                self.update_session_dropdown()
+        except Exception as e:
+            print(f"⚠️ Error switching session: {e}")
+            
+    def create_new_session(self):
+        """Enhanced new session creation"""
+        try:
+            new_session_id = create_new_session()
+            self.session_id = new_session_id
+            self.current_custom_instructions = ""
+            self.instructions_locked = False
+            if hasattr(self, 'custom_instructions_btn'):
+                self.custom_instructions_btn.update_session(new_session_id)
+            self.update_session_dropdown()
+            self.status_label.setText("AI Brain")
+        except Exception as e:
+            print(f"⚠️ Error creating new session: {e}")
         
-        QTimer.singleShot(5000, lambda: self.status_label.setText("AI Brain"))
+    def set_stealth_mode(self, enabled):
+        """Set stealth mode"""
+        self.is_stealth_mode = enabled
+        if enabled:
+            self.hide()
+        else:
+            self.show()
+        self.stealth_mode_changed.emit(enabled)
+        
+    def check_api_key(self):
+        """Enhanced API key checking"""
+        try:
+            api_key = get_api_key()
+            if not api_key:
+                QTimer.singleShot(100, self.show_api_key_setup)
+            else:
+                # Enhanced status based on custom instructions
+                if self.current_custom_instructions:
+                    if self.instructions_locked:
+                        self.status_label.setText("🔒 Locked AI")
+                    else:
+                        self.status_label.setText("🎯 Custom AI")
+                else:
+                    self.status_label.setText("AI Brain")
+        except Exception as e:
+            print(f"⚠️ Error checking API key: {e}")
+            
+    def show_api_key_setup(self):
+        """Show API key setup"""
+        try:
+            dialog = FixedAPIDialog(self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                save_api_key(dialog.api_key)
+                # Enhanced status based on custom instructions
+                if self.current_custom_instructions:
+                    if self.instructions_locked:
+                        self.status_label.setText("🔒 Locked AI")
+                    else:
+                        self.status_label.setText("🎯 Custom AI")
+                else:
+                    self.status_label.setText("AI Brain")
+            else:
+                self.close_application()
+        except Exception as e:
+            print(f"⚠️ Error showing API key setup: {e}")
+            
+    def show_settings(self):
+        """Show settings"""
+        try:
+            dialog = FixedSettingsDialog(self)
+            dialog.exec()
+        except Exception as e:
+            print(f"⚠️ Error showing settings: {e}")
+        
+    def reset_data(self):
+        """Reset data"""
+        try:
+            save_api_key("")
+            self.show_api_key_setup()
+        except Exception as e:
+            print(f"⚠️ Error resetting data: {e}")
+        
+    def toggle_visibility(self):
+        """Toggle visibility"""
+        try:
+            if self.isVisible():
+                self.hide()
+            else:
+                self.show()
+                self.raise_()
+                self.activateWindow()
+        except Exception as e:
+            print(f"⚠️ Error toggling visibility: {e}")
+            
+    def quick_question(self, question):
+        """Quick question"""
+        try:
+            self.question_input.setPlainText(question)
+            self.process_question()
+        except Exception as e:
+            print(f"⚠️ Error with quick question: {e}")
         
     def close_application(self):
-        """Close application"""
-        QApplication.instance().quit()
+        """Enhanced application closing"""
+        try:
+            print("🛑 Closing application...")
+            
+            if self.ai_worker and self.ai_worker.isRunning():
+                print("🛑 Stopping AI worker...")
+                self.ai_worker.quit()
+                self.ai_worker.wait(3000)  # Increased wait time
+            
+            if hasattr(self, 'loading_widget'):
+                self.loading_widget.stop_animation()
+                
+            QApplication.instance().quit()
+        except Exception as e:
+            print(f"⚠️ Error closing application: {e}")
         
     def closeEvent(self, event):
-        """Handle close event"""
+        """Close event"""
         self.close_application()
         event.accept()
