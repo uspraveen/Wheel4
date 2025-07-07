@@ -275,7 +275,7 @@ def call_openai_with_enhanced_timeout(client, messages, response_tokens, timeout
             print(f"🔍 DEBUG: Starting API call in thread (attempt {attempt_num + 1})...")
             
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=messages,
                 max_tokens=int(response_tokens),
                 temperature=0.3,

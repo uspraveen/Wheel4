@@ -218,13 +218,14 @@ def main():
         startup_time = time.time() - start_total
         print(f"🎉 Wheel4 ready in {startup_time:.2f}s!")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print("   FIXED Controls:")
+        print("   🎨 SLEEK WHEEL4 CONTROLS:")
         print("   • Ctrl+\\ → Toggle visibility")
         print("   • Ctrl+Enter → Show input box")
         print("   • Then: Type & Enter → Process question")
         print("   • Or: Just Enter → Analyze screen")
-        print("   • Custom Instructions: Set before first use")
-        print("   • Instructions lock after first interaction")
+        print("   • Settings → Custom Instructions") 
+        print("   • Glassy black interface like Cluely")
+        print("   • Fixed timeout issues")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
         # Run application
